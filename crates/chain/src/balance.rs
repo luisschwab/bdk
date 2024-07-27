@@ -1,20 +1,4 @@
-//! Module for keychain related structures.
-//!
-//! A keychain here is a set of application-defined indexes for a miniscript descriptor where we can
-//! derive script pubkeys at a particular derivation index. The application's index is simply
-//! anything that implements `Ord`.
-//!
-//! [`KeychainTxOutIndex`] indexes script pubkeys of keychains and scans in relevant outpoints (that
-//! has a `txout` containing an indexed script pubkey). Internally, this uses [`SpkTxOutIndex`], but
-//! also maintains "revealed" and "lookahead" index counts per keychain.
-//!
-//! [`SpkTxOutIndex`]: crate::SpkTxOutIndex
-
-#[cfg(feature = "miniscript")]
-mod txout_index;
 use bitcoin::Amount;
-#[cfg(feature = "miniscript")]
-pub use txout_index::*;
 
 /// Balance, differentiated into various categories.
 #[derive(Debug, PartialEq, Eq, Clone, Default)]

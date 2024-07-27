@@ -2,13 +2,13 @@ use std::collections::BTreeSet;
 
 use async_trait::async_trait;
 use bdk_chain::spk_client::{FullScanRequest, FullScanResult, SyncRequest, SyncResult};
-use bdk_chain::Anchor;
 use bdk_chain::{
     bitcoin::{BlockHash, OutPoint, ScriptBuf, TxOut, Txid},
     collections::BTreeMap,
     local_chain::CheckPoint,
-    BlockId, ConfirmationTimeHeightAnchor, TxGraph,
+    BlockId, ConfirmationBlockTime, TxGraph,
 };
+use bdk_chain::{Anchor, Indexed};
 use esplora_client::{Amount, TxStatus};
 use futures::{stream::FuturesOrdered, TryStreamExt};
 
@@ -231,19 +231,19 @@ async fn chain_update<A: Anchor>(
 }
 
 /// This performs a full scan to get an update for the [`TxGraph`] and
-/// [`KeychainTxOutIndex`](bdk_chain::keychain::KeychainTxOutIndex).
+/// [`KeychainTxOutIndex`](bdk_chain::indexer::keychain_txout::KeychainTxOutIndex).
 async fn full_scan_for_index_and_graph<K: Ord + Clone + Send>(
     client: &esplora_client::AsyncClient,
     keychain_spks: BTreeMap<
         K,
-        impl IntoIterator<IntoIter = impl Iterator<Item = (u32, ScriptBuf)> + Send> + Send,
+        impl IntoIterator<IntoIter = impl Iterator<Item = Indexed<ScriptBuf>> + Send> + Send,
     >,
     stop_gap: usize,
     parallel_requests: usize,
-) -> Result<(TxGraph<ConfirmationTimeHeightAnchor>, BTreeMap<K, u32>), Error> {
+) -> Result<(TxGraph<ConfirmationBlockTime>, BTreeMap<K, u32>), Error> {
     type TxsOfSpkIndex = (u32, Vec<esplora_client::Tx>);
     let parallel_requests = Ord::max(parallel_requests, 1);
-    let mut graph = TxGraph::<ConfirmationTimeHeightAnchor>::default();
+    let mut graph = TxGraph::<ConfirmationBlockTime>::default();
     let mut last_active_indexes = BTreeMap::<K, u32>::new();
 
     for (keychain, spks) in keychain_spks {
@@ -333,7 +333,7 @@ async fn sync_for_index_and_graph(
     txids: impl IntoIterator<IntoIter = impl Iterator<Item = Txid> + Send> + Send,
     outpoints: impl IntoIterator<IntoIter = impl Iterator<Item = OutPoint> + Send> + Send,
     parallel_requests: usize,
-) -> Result<TxGraph<ConfirmationTimeHeightAnchor>, Error> {
+) -> Result<TxGraph<ConfirmationBlockTime>, Error> {
     let mut graph = full_scan_for_index_and_graph(
         client,
         [(

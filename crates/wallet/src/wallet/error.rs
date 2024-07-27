@@ -16,7 +16,7 @@ use crate::descriptor::DescriptorError;
 use crate::wallet::coin_selection;
 use crate::{descriptor, KeychainKind};
 use alloc::string::String;
-use bitcoin::{absolute, psbt, OutPoint, Sequence, Txid};
+use bitcoin::{absolute, psbt, Amount, OutPoint, Sequence, Txid};
 use core::fmt;
 
 /// Errors returned by miniscript when updating inconsistent PSBTs
@@ -50,8 +50,6 @@ impl std::error::Error for MiniscriptPsbtError {}
 pub enum CreateTxError {
     /// There was a problem with the descriptors passed in
     Descriptor(DescriptorError),
-    /// We were unable to load wallet data from or write wallet data to the persistence backend
-    Persist(anyhow::Error),
     /// There was a problem while extracting and manipulating policies
     Policy(PolicyError),
     /// Spending policy is not compatible with this [`KeychainKind`]
@@ -78,8 +76,8 @@ pub enum CreateTxError {
     },
     /// When bumping a tx the absolute fee requested is lower than replaced tx absolute fee
     FeeTooLow {
-        /// Required fee absolute value (satoshi)
-        required: u64,
+        /// Required fee absolute value [`Amount`]
+        required: Amount,
     },
     /// When bumping a tx the fee rate requested is lower than required
     FeeRateTooLow {
@@ -90,17 +88,8 @@ pub enum CreateTxError {
     NoUtxosSelected,
     /// Output created is under the dust limit, 546 satoshis
     OutputBelowDustLimit(usize),
-    /// The `change_policy` was set but the wallet does not have a change_descriptor
-    ChangePolicyDescriptor,
     /// There was an error with coin selection
     CoinSelection(coin_selection::Error),
-    /// Wallet's UTXO set is not enough to cover recipient's requested plus fee
-    InsufficientFunds {
-        /// Sats needed for some transaction
-        needed: u64,
-        /// Sats available for spending
-        available: u64,
-    },
     /// Cannot build a tx without recipients
     NoRecipients,
     /// Partially signed bitcoin transaction error
@@ -123,13 +112,6 @@ impl fmt::Display for CreateTxError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Descriptor(e) => e.fmt(f),
-            Self::Persist(e) => {
-                write!(
-                    f,
-                    "failed to load wallet data from or write wallet data to persistence backend: {}",
-                    e
-                )
-            }
             Self::Policy(e) => e.fmt(f),
             CreateTxError::SpendingPolicyRequired(keychain_kind) => {
                 write!(f, "Spending policy required: {:?}", keychain_kind)
@@ -160,7 +142,7 @@ impl fmt::Display for CreateTxError {
                 )
             }
             CreateTxError::FeeTooLow { required } => {
-                write!(f, "Fee to low: required {} sat", required)
+                write!(f, "Fee to low: required {}", required.display_dynamic())
             }
             CreateTxError::FeeRateTooLow { required } => {
                 write!(
@@ -177,20 +159,7 @@ impl fmt::Display for CreateTxError {
             CreateTxError::OutputBelowDustLimit(limit) => {
                 write!(f, "Output below the dust limit: {}", limit)
             }
-            CreateTxError::ChangePolicyDescriptor => {
-                write!(
-                    f,
-                    "The `change_policy` can be set only if the wallet has a change_descriptor"
-                )
-            }
             CreateTxError::CoinSelection(e) => e.fmt(f),
-            CreateTxError::InsufficientFunds { needed, available } => {
-                write!(
-                    f,
-                    "Insufficient funds: {} sat available of {} sat needed",
-                    available, needed
-                )
-            }
             CreateTxError::NoRecipients => {
                 write!(f, "Cannot build tx without recipients")
             }

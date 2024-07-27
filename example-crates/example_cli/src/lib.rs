@@ -3,6 +3,7 @@ use anyhow::Context;
 use bdk_coin_select::{coin_select_bnb, CoinSelector, CoinSelectorOpt, WeightedValue};
 use bdk_file_store::Store;
 use serde::{de::DeserializeOwned, Serialize};
+use std::fmt::Debug;
 use std::{cmp::Reverse, collections::BTreeMap, path::PathBuf, sync::Mutex, time::Duration};
 
 use bdk_chain::{
@@ -13,16 +14,15 @@ use bdk_chain::{
         transaction, Address, Amount, Network, Sequence, Transaction, TxIn, TxOut,
     },
     indexed_tx_graph::{self, IndexedTxGraph},
-    keychain::{self, KeychainTxOutIndex},
+    indexer::keychain_txout::{self, KeychainTxOutIndex},
     local_chain,
     miniscript::{
         descriptor::{DescriptorSecretKey, KeyMap},
         Descriptor, DescriptorPublicKey,
     },
-    Anchor, Append, ChainOracle, DescriptorExt, FullTxOut,
+    Anchor, ChainOracle, DescriptorExt, FullTxOut, Merge,
 };
 pub use bdk_file_store;
-use bdk_persist::{Persist, PersistBackend};
 pub use clap;
 
 use clap::{Parser, Subcommand};
@@ -30,7 +30,7 @@ use clap::{Parser, Subcommand};
 pub type KeychainTxGraph<A> = IndexedTxGraph<A, KeychainTxOutIndex<Keychain>>;
 pub type KeychainChangeSet<A> = (
     local_chain::ChangeSet,
-    indexed_tx_graph::ChangeSet<A, keychain::ChangeSet<Keychain>>,
+    indexed_tx_graph::ChangeSet<A, keychain_txout::ChangeSet>,
 );
 
 #[derive(Parser)]
@@ -191,7 +191,7 @@ impl core::fmt::Display for Keychain {
 }
 
 pub struct CreateTxChange {
-    pub index_changeset: keychain::ChangeSet<Keychain>,
+    pub index_changeset: keychain_txout::ChangeSet,
     pub change_keychain: Keychain,
     pub index: u32,
 }
@@ -207,7 +207,7 @@ pub fn create_tx<A: Anchor, O: ChainOracle>(
 where
     O::Error: std::error::Error + Send + Sync + 'static,
 {
-    let mut changeset = keychain::ChangeSet::default();
+    let mut changeset = keychain_txout::ChangeSet::default();
 
     let assets = bdk_tmp_plan::Assets {
         keys: keymap.iter().map(|(pk, _)| pk.clone()).collect(),
@@ -252,7 +252,7 @@ where
     let internal_keychain = if graph
         .index
         .keychains()
-        .any(|(k, _)| *k == Keychain::Internal)
+        .any(|(k, _)| k == Keychain::Internal)
     {
         Keychain::Internal
     } else {
@@ -261,18 +261,15 @@ where
 
     let ((change_index, change_script), change_changeset) = graph
         .index
-        .next_unused_spk(&internal_keychain)
+        .next_unused_spk(internal_keychain)
         .expect("Must exist");
-    changeset.append(change_changeset);
-
-    // Clone to drop the immutable reference.
-    let change_script = change_script.into();
+    changeset.merge(change_changeset);
 
     let change_plan = bdk_tmp_plan::plan_satisfaction(
         &graph
             .index
             .keychains()
-            .find(|(k, _)| *k == &internal_keychain)
+            .find(|(k, _)| *k == internal_keychain)
             .expect("must exist")
             .1
             .at_derivation_index(change_index)
@@ -291,7 +288,7 @@ where
         min_drain_value: graph
             .index
             .keychains()
-            .find(|(k, _)| *k == &internal_keychain)
+            .find(|(k, _)| *k == internal_keychain)
             .expect("must exist")
             .1
             .dust_value(),
@@ -427,7 +424,7 @@ pub fn planned_utxos<A: Anchor, O: ChainOracle, K: Clone + bdk_tmp_plan::CanDeri
     let outpoints = graph.index.outpoints();
     graph
         .graph()
-        .try_filter_chain_unspents(chain, chain_tip, outpoints)
+        .try_filter_chain_unspents(chain, chain_tip, outpoints.iter().cloned())
         .filter_map(|r| -> Option<Result<PlannedUtxo<K, A>, _>> {
             let (k, i, full_txo) = match r {
                 Err(err) => return Some(Err(err)),
@@ -436,7 +433,7 @@ pub fn planned_utxos<A: Anchor, O: ChainOracle, K: Clone + bdk_tmp_plan::CanDeri
             let desc = graph
                 .index
                 .keychains()
-                .find(|(keychain, _)| *keychain == &k)
+                .find(|(keychain, _)| *keychain == k)
                 .expect("keychain must exist")
                 .1
                 .at_derivation_index(i)
@@ -449,7 +446,7 @@ pub fn planned_utxos<A: Anchor, O: ChainOracle, K: Clone + bdk_tmp_plan::CanDeri
 
 pub fn handle_commands<CS: clap::Subcommand, S: clap::Args, A: Anchor, O: ChainOracle, C>(
     graph: &Mutex<KeychainTxGraph<A>>,
-    db: &Mutex<Persist<C>>,
+    db: &Mutex<Store<C>>,
     chain: &Mutex<O>,
     keymap: &BTreeMap<DescriptorPublicKey, DescriptorSecretKey>,
     network: Network,
@@ -458,7 +455,14 @@ pub fn handle_commands<CS: clap::Subcommand, S: clap::Args, A: Anchor, O: ChainO
 ) -> anyhow::Result<()>
 where
     O::Error: std::error::Error + Send + Sync + 'static,
-    C: Default + Append + DeserializeOwned + Serialize + From<KeychainChangeSet<A>>,
+    C: Default
+        + Merge
+        + DeserializeOwned
+        + Serialize
+        + From<KeychainChangeSet<A>>
+        + Send
+        + Sync
+        + Debug,
 {
     match cmd {
         Commands::ChainSpecific(_) => unreachable!("example code should handle this!"),
@@ -475,14 +479,14 @@ where
                     };
 
                     let ((spk_i, spk), index_changeset) =
-                        spk_chooser(index, &Keychain::External).expect("Must exist");
+                        spk_chooser(index, Keychain::External).expect("Must exist");
                     let db = &mut *db.lock().unwrap();
-                    db.stage_and_commit(C::from((
+                    db.append_changeset(&C::from((
                         local_chain::ChangeSet::default(),
                         indexed_tx_graph::ChangeSet::from(index_changeset),
                     )))?;
-                    let addr =
-                        Address::from_script(spk, network).context("failed to derive address")?;
+                    let addr = Address::from_script(spk.as_script(), network)
+                        .context("failed to derive address")?;
                     println!("[address @ {}] {}", spk_i, addr);
                     Ok(())
                 }
@@ -497,8 +501,8 @@ where
                         true => Keychain::Internal,
                         false => Keychain::External,
                     };
-                    for (spk_i, spk) in index.revealed_keychain_spks(&target_keychain) {
-                        let address = Address::from_script(spk, network)
+                    for (spk_i, spk) in index.revealed_keychain_spks(target_keychain) {
+                        let address = Address::from_script(spk.as_script(), network)
                             .expect("should always be able to derive address");
                         println!(
                             "{:?} {} used:{}",
@@ -527,7 +531,7 @@ where
             let balance = graph.graph().try_balance(
                 chain,
                 chain.get_chain_tip()?,
-                graph.index.outpoints(),
+                graph.index.outpoints().iter().cloned(),
                 |(k, _), _| k == &Keychain::Internal,
             )?;
 
@@ -568,7 +572,7 @@ where
                 } => {
                     let txouts = graph
                         .graph()
-                        .try_filter_chain_txouts(chain, chain_tip, outpoints)
+                        .try_filter_chain_txouts(chain, chain_tip, outpoints.iter().cloned())
                         .filter(|r| match r {
                             Ok((_, full_txo)) => match (spent, unspent) {
                                 (true, false) => full_txo.spent_by.is_some(),
@@ -625,7 +629,7 @@ where
                     // If we're unable to persist this, then we don't want to broadcast.
                     {
                         let db = &mut *db.lock().unwrap();
-                        db.stage_and_commit(C::from((
+                        db.append_changeset(&C::from((
                             local_chain::ChangeSet::default(),
                             indexed_tx_graph::ChangeSet::from(index_changeset),
                         )))?;
@@ -643,14 +647,14 @@ where
 
             match (broadcast)(chain_specific, &transaction) {
                 Ok(_) => {
-                    println!("Broadcasted Tx : {}", transaction.txid());
+                    println!("Broadcasted Tx : {}", transaction.compute_txid());
 
                     let keychain_changeset = graph.lock().unwrap().insert_tx(transaction);
 
                     // We know the tx is at least unconfirmed now. Note if persisting here fails,
                     // it's not a big deal since we can always find it again form
                     // blockchain.
-                    db.lock().unwrap().stage_and_commit(C::from((
+                    db.lock().unwrap().append_changeset(&C::from((
                         local_chain::ChangeSet::default(),
                         keychain_changeset,
                     )))?;
@@ -669,7 +673,10 @@ where
 }
 
 /// The initial state returned by [`init`].
-pub struct Init<CS: clap::Subcommand, S: clap::Args, C> {
+pub struct Init<CS: clap::Subcommand, S: clap::Args, C>
+where
+    C: Default + Merge + Serialize + DeserializeOwned + Debug + Send + Sync + 'static,
+{
     /// Arguments parsed by the cli.
     pub args: Args<CS, S>,
     /// Descriptor keymap.
@@ -677,7 +684,7 @@ pub struct Init<CS: clap::Subcommand, S: clap::Args, C> {
     /// Keychain-txout index.
     pub index: KeychainTxOutIndex<Keychain>,
     /// Persistence backend.
-    pub db: Mutex<Persist<C>>,
+    pub db: Mutex<Store<C>>,
     /// Initial changeset.
     pub init_changeset: C,
 }
@@ -690,9 +697,10 @@ pub fn init<CS: clap::Subcommand, S: clap::Args, C>(
 ) -> anyhow::Result<Init<CS, S, C>>
 where
     C: Default
-        + Append
+        + Merge
         + Serialize
         + DeserializeOwned
+        + Debug
         + core::marker::Send
         + core::marker::Sync
         + 'static,
@@ -709,7 +717,7 @@ where
     // them in the index here. However, the keymap is not stored in the database.
     let (descriptor, mut keymap) =
         Descriptor::<DescriptorPublicKey>::parse_descriptor(&secp, &args.descriptor)?;
-    let _ = index.insert_descriptor(Keychain::External, descriptor);
+    let _ = index.insert_descriptor(Keychain::External, descriptor)?;
 
     if let Some((internal_descriptor, internal_keymap)) = args
         .change_descriptor
@@ -718,7 +726,7 @@ where
         .transpose()?
     {
         keymap.extend(internal_keymap);
-        let _ = index.insert_descriptor(Keychain::Internal, internal_descriptor);
+        let _ = index.insert_descriptor(Keychain::Internal, internal_descriptor)?;
     }
 
     let mut db_backend = match Store::<C>::open_or_create_new(db_magic, &args.db_path) {
@@ -727,13 +735,13 @@ where
         Err(err) => return Err(anyhow::anyhow!("failed to init db backend: {:?}", err)),
     };
 
-    let init_changeset = db_backend.load_from_persistence()?.unwrap_or_default();
+    let init_changeset = db_backend.aggregate_changesets()?.unwrap_or_default();
 
     Ok(Init {
         args,
         keymap,
         index,
-        db: Mutex::new(Persist::new(db_backend)),
+        db: Mutex::new(db_backend),
         init_changeset,
     })
 }

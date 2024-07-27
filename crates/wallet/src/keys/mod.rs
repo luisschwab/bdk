@@ -20,6 +20,8 @@ use core::marker::PhantomData;
 use core::ops::Deref;
 use core::str::FromStr;
 
+use rand_core::{CryptoRng, RngCore};
+
 use bitcoin::secp256k1::{self, Secp256k1, Signing};
 
 use bitcoin::bip32;
@@ -336,7 +338,7 @@ impl<Ctx: ScriptContext> ExtendedKey<Ctx> {
     pub fn into_xprv(self, network: Network) -> Option<bip32::Xpriv> {
         match self {
             ExtendedKey::Private((mut xprv, _)) => {
-                xprv.network = network;
+                xprv.network = network.into();
                 Some(xprv)
             }
             ExtendedKey::Public(_) => None,
@@ -355,7 +357,7 @@ impl<Ctx: ScriptContext> ExtendedKey<Ctx> {
             ExtendedKey::Public((xpub, _)) => xpub,
         };
 
-        xpub.network = network;
+        xpub.network = network.into();
         xpub
     }
 }
@@ -402,7 +404,7 @@ impl<Ctx: ScriptContext> From<bip32::Xpriv> for ExtendedKey<Ctx> {
 /// impl<Ctx: ScriptContext> DerivableKey<Ctx> for MyCustomKeyType {
 ///     fn into_extended_key(self) -> Result<ExtendedKey<Ctx>, KeyError> {
 ///         let xprv = bip32::Xpriv {
-///             network: self.network,
+///             network: self.network.into(),
 ///             depth: 0,
 ///             parent_fingerprint: bip32::Fingerprint::default(),
 ///             private_key: self.key_data.inner,
@@ -434,7 +436,7 @@ impl<Ctx: ScriptContext> From<bip32::Xpriv> for ExtendedKey<Ctx> {
 /// impl<Ctx: ScriptContext> DerivableKey<Ctx> for MyCustomKeyType {
 ///     fn into_extended_key(self) -> Result<ExtendedKey<Ctx>, KeyError> {
 ///         let xprv = bip32::Xpriv {
-///             network: bitcoin::Network::Bitcoin, // pick an arbitrary network here
+///             network: bitcoin::Network::Bitcoin.into(), // pick an arbitrary network here
 ///             depth: 0,
 ///             parent_fingerprint: bip32::Fingerprint::default(),
 ///             private_key: self.key_data.inner,
@@ -631,12 +633,23 @@ pub trait GeneratableKey<Ctx: ScriptContext>: Sized {
         entropy: Self::Entropy,
     ) -> Result<GeneratedKey<Self, Ctx>, Self::Error>;
 
-    /// Generate a key given the options with a random entropy
+    /// Generate a key given the options with random entropy.
+    ///
+    /// Uses the thread-local random number generator.
+    #[cfg(feature = "std")]
     fn generate(options: Self::Options) -> Result<GeneratedKey<Self, Ctx>, Self::Error> {
-        use rand::{thread_rng, Rng};
+        Self::generate_with_aux_rand(options, &mut bitcoin::key::rand::thread_rng())
+    }
 
+    /// Generate a key given the options with random entropy.
+    ///
+    /// Uses a provided random number generator (rng).
+    fn generate_with_aux_rand(
+        options: Self::Options,
+        rng: &mut (impl CryptoRng + RngCore),
+    ) -> Result<GeneratedKey<Self, Ctx>, Self::Error> {
         let mut entropy = Self::Entropy::default();
-        thread_rng().fill(entropy.as_mut());
+        rng.fill_bytes(entropy.as_mut());
         Self::generate_with_entropy(options, entropy)
     }
 }
@@ -657,8 +670,20 @@ where
     }
 
     /// Generate a key with the default options and a random entropy
+    ///
+    /// Uses the thread-local random number generator.
+    #[cfg(feature = "std")]
     fn generate_default() -> Result<GeneratedKey<Self, Ctx>, Self::Error> {
-        Self::generate(Default::default())
+        Self::generate_with_aux_rand(Default::default(), &mut bitcoin::key::rand::thread_rng())
+    }
+
+    /// Generate a key with the default options and a random entropy
+    ///
+    /// Uses a provided random number generator (rng).
+    fn generate_default_with_aux_rand(
+        rng: &mut (impl CryptoRng + RngCore),
+    ) -> Result<GeneratedKey<Self, Ctx>, Self::Error> {
+        Self::generate_with_aux_rand(Default::default(), rng)
     }
 }
 
@@ -717,7 +742,7 @@ impl<Ctx: ScriptContext> GeneratableKey<Ctx> for PrivateKey {
         let inner = secp256k1::SecretKey::from_slice(&entropy)?;
         let private_key = PrivateKey {
             compressed: options.compressed,
-            network: Network::Bitcoin,
+            network: Network::Bitcoin.into(),
             inner,
         };
 
@@ -847,9 +872,7 @@ impl<Ctx: ScriptContext> IntoDescriptorKey<Ctx> for DescriptorPublicKey {
     fn into_descriptor_key(self) -> Result<DescriptorKey<Ctx>, KeyError> {
         let networks = match self {
             DescriptorPublicKey::Single(_) => any_network(),
-            DescriptorPublicKey::XPub(DescriptorXKey { xkey, .. })
-                if xkey.network == Network::Bitcoin =>
-            {
+            DescriptorPublicKey::XPub(DescriptorXKey { xkey, .. }) if xkey.network.is_mainnet() => {
                 mainnet_network()
             }
             _ => test_networks(),
@@ -882,12 +905,8 @@ impl<Ctx: ScriptContext> IntoDescriptorKey<Ctx> for XOnlyPublicKey {
 impl<Ctx: ScriptContext> IntoDescriptorKey<Ctx> for DescriptorSecretKey {
     fn into_descriptor_key(self) -> Result<DescriptorKey<Ctx>, KeyError> {
         let networks = match &self {
-            DescriptorSecretKey::Single(sk) if sk.key.network == Network::Bitcoin => {
-                mainnet_network()
-            }
-            DescriptorSecretKey::XPrv(DescriptorXKey { xkey, .. })
-                if xkey.network == Network::Bitcoin =>
-            {
+            DescriptorSecretKey::Single(sk) if sk.key.network.is_mainnet() => mainnet_network(),
+            DescriptorSecretKey::XPrv(DescriptorXKey { xkey, .. }) if xkey.network.is_mainnet() => {
                 mainnet_network()
             }
             _ => test_networks(),
@@ -916,7 +935,7 @@ impl<Ctx: ScriptContext> IntoDescriptorKey<Ctx> for PrivateKey {
 }
 
 /// Errors thrown while working with [`keys`](crate::keys)
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum KeyError {
     /// The key cannot exist in the given script context
     InvalidScriptContext,
@@ -1003,6 +1022,6 @@ pub mod test {
         .unwrap();
         let xprv = xkey.into_xprv(Network::Testnet).unwrap();
 
-        assert_eq!(xprv.network, Network::Testnet);
+        assert_eq!(xprv.network, Network::Testnet.into());
     }
 }

@@ -8,13 +8,11 @@ use std::{collections::BTreeSet, sync::Arc};
 use crate::common::DESCRIPTORS;
 use bdk_chain::{
     indexed_tx_graph::{self, IndexedTxGraph},
-    keychain::{self, Balance, KeychainTxOutIndex},
+    indexer::keychain_txout::KeychainTxOutIndex,
     local_chain::LocalChain,
-    tx_graph, ChainPosition, ConfirmationHeightAnchor, DescriptorExt,
+    tx_graph, Balance, ChainPosition, ConfirmationBlockTime, DescriptorExt,
 };
-use bitcoin::{
-    secp256k1::Secp256k1, Amount, OutPoint, Script, ScriptBuf, Transaction, TxIn, TxOut,
-};
+use bitcoin::{secp256k1::Secp256k1, Amount, OutPoint, ScriptBuf, Transaction, TxIn, TxOut};
 use miniscript::Descriptor;
 
 /// Ensure [`IndexedTxGraph::insert_relevant_txs`] can successfully index transactions NOT presented
@@ -26,15 +24,19 @@ use miniscript::Descriptor;
 /// agnostic.
 #[test]
 fn insert_relevant_txs() {
+    use bdk_chain::indexer::keychain_txout;
     let (descriptor, _) = Descriptor::parse_descriptor(&Secp256k1::signing_only(), DESCRIPTORS[0])
         .expect("must be valid");
     let spk_0 = descriptor.at_derivation_index(0).unwrap().script_pubkey();
     let spk_1 = descriptor.at_derivation_index(9).unwrap().script_pubkey();
 
-    let mut graph = IndexedTxGraph::<ConfirmationHeightAnchor, KeychainTxOutIndex<()>>::new(
+    let mut graph = IndexedTxGraph::<ConfirmationBlockTime, KeychainTxOutIndex<()>>::new(
         KeychainTxOutIndex::new(10),
     );
-    let _ = graph.index.insert_descriptor((), descriptor.clone());
+    let _ = graph
+        .index
+        .insert_descriptor((), descriptor.clone())
+        .unwrap();
 
     let tx_a = Transaction {
         output: vec![
@@ -52,7 +54,7 @@ fn insert_relevant_txs() {
 
     let tx_b = Transaction {
         input: vec![TxIn {
-            previous_output: OutPoint::new(tx_a.txid(), 0),
+            previous_output: OutPoint::new(tx_a.compute_txid(), 0),
             ..Default::default()
         }],
         ..common::new_tx(1)
@@ -60,7 +62,7 @@ fn insert_relevant_txs() {
 
     let tx_c = Transaction {
         input: vec![TxIn {
-            previous_output: OutPoint::new(tx_a.txid(), 1),
+            previous_output: OutPoint::new(tx_a.compute_txid(), 1),
             ..Default::default()
         }],
         ..common::new_tx(2)
@@ -69,13 +71,12 @@ fn insert_relevant_txs() {
     let txs = [tx_c, tx_b, tx_a];
 
     let changeset = indexed_tx_graph::ChangeSet {
-        graph: tx_graph::ChangeSet {
+        tx_graph: tx_graph::ChangeSet {
             txs: txs.iter().cloned().map(Arc::new).collect(),
             ..Default::default()
         },
-        indexer: keychain::ChangeSet {
+        indexer: keychain_txout::ChangeSet {
             last_revealed: [(descriptor.descriptor_id(), 9_u32)].into(),
-            keychains_added: [].into(),
         },
     };
 
@@ -86,10 +87,9 @@ fn insert_relevant_txs() {
 
     // The initial changeset will also contain info about the keychain we added
     let initial_changeset = indexed_tx_graph::ChangeSet {
-        graph: changeset.graph,
-        indexer: keychain::ChangeSet {
+        tx_graph: changeset.tx_graph,
+        indexer: keychain_txout::ChangeSet {
             last_revealed: changeset.indexer.last_revealed,
-            keychains_added: [((), descriptor)].into(),
         },
     };
 
@@ -113,8 +113,8 @@ fn insert_relevant_txs() {
 /// tx1: A Coinbase, sending 70000 sats to "trusted" address. [Block 0]
 /// tx2: A external Receive, sending 30000 sats to "untrusted" address. [Block 1]
 /// tx3: Internal Spend. Spends tx2 and returns change of 10000 to "trusted" address. [Block 2]
-/// tx4: Mempool tx, sending 20000 sats to "trusted" address.
-/// tx5: Mempool tx, sending 15000 sats to "untested" address.
+/// tx4: Mempool tx, sending 20000 sats to "untrusted" address.
+/// tx5: Mempool tx, sending 15000 sats to "trusted" address.
 /// tx6: Complete unrelated tx. [Block 3]
 ///
 /// Different transactions are added via `insert_relevant_txs`.
@@ -136,12 +136,18 @@ fn test_list_owned_txouts() {
     let (desc_2, _) =
         Descriptor::parse_descriptor(&Secp256k1::signing_only(), common::DESCRIPTORS[3]).unwrap();
 
-    let mut graph = IndexedTxGraph::<ConfirmationHeightAnchor, KeychainTxOutIndex<String>>::new(
+    let mut graph = IndexedTxGraph::<ConfirmationBlockTime, KeychainTxOutIndex<String>>::new(
         KeychainTxOutIndex::new(10),
     );
 
-    let _ = graph.index.insert_descriptor("keychain_1".into(), desc_1);
-    let _ = graph.index.insert_descriptor("keychain_2".into(), desc_2);
+    assert!(graph
+        .index
+        .insert_descriptor("keychain_1".into(), desc_1)
+        .unwrap());
+    assert!(graph
+        .index
+        .insert_descriptor("keychain_2".into(), desc_2)
+        .unwrap());
 
     // Get trusted and untrusted addresses
 
@@ -149,11 +155,11 @@ fn test_list_owned_txouts() {
     let mut untrusted_spks: Vec<ScriptBuf> = Vec::new();
 
     {
-        // we need to scope here to take immutanble reference of the graph
+        // we need to scope here to take immutable reference of the graph
         for _ in 0..10 {
             let ((_, script), _) = graph
                 .index
-                .reveal_next_spk(&"keychain_1".to_string())
+                .reveal_next_spk("keychain_1".to_string())
                 .unwrap();
             // TODO Assert indexes
             trusted_spks.push(script.to_owned());
@@ -163,7 +169,7 @@ fn test_list_owned_txouts() {
         for _ in 0..10 {
             let ((_, script), _) = graph
                 .index
-                .reveal_next_spk(&"keychain_2".to_string())
+                .reveal_next_spk("keychain_2".to_string())
                 .unwrap();
             untrusted_spks.push(script.to_owned());
         }
@@ -196,7 +202,7 @@ fn test_list_owned_txouts() {
     // tx3 spends tx2 and gives a change back in trusted keychain. Confirmed at Block 2.
     let tx3 = Transaction {
         input: vec![TxIn {
-            previous_output: OutPoint::new(tx2.txid(), 0),
+            previous_output: OutPoint::new(tx2.compute_txid(), 0),
             ..Default::default()
         }],
         output: vec![TxOut {
@@ -215,7 +221,7 @@ fn test_list_owned_txouts() {
         ..common::new_tx(0)
     };
 
-    // tx5 is spending tx3 and receiving change at trusted keychain, unconfirmed.
+    // tx5 is an external transaction receiving at trusted keychain, unconfirmed.
     let tx5 = Transaction {
         output: vec![TxOut {
             value: Amount::from_sat(15000),
@@ -228,7 +234,7 @@ fn test_list_owned_txouts() {
     let tx6 = common::new_tx(0);
 
     // Insert transactions into graph with respective anchors
-    // For unconfirmed txs we pass in `None`.
+    // Insert unconfirmed txs with a last_seen timestamp
 
     let _ =
         graph.batch_insert_relevant([&tx1, &tx2, &tx3, &tx6].iter().enumerate().map(|(i, tx)| {
@@ -238,9 +244,9 @@ fn test_list_owned_txouts() {
                 local_chain
                     .get(height)
                     .map(|cp| cp.block_id())
-                    .map(|anchor_block| ConfirmationHeightAnchor {
-                        anchor_block,
-                        confirmation_height: anchor_block.height,
+                    .map(|block_id| ConfirmationBlockTime {
+                        block_id,
+                        confirmation_time: 100,
                     }),
             )
         }));
@@ -249,31 +255,35 @@ fn test_list_owned_txouts() {
 
     // A helper lambda to extract and filter data from the graph.
     let fetch =
-        |height: u32,
-         graph: &IndexedTxGraph<ConfirmationHeightAnchor, KeychainTxOutIndex<String>>| {
+        |height: u32, graph: &IndexedTxGraph<ConfirmationBlockTime, KeychainTxOutIndex<String>>| {
             let chain_tip = local_chain
                 .get(height)
                 .map(|cp| cp.block_id())
                 .unwrap_or_else(|| panic!("block must exist at {}", height));
             let txouts = graph
                 .graph()
-                .filter_chain_txouts(&local_chain, chain_tip, graph.index.outpoints())
+                .filter_chain_txouts(
+                    &local_chain,
+                    chain_tip,
+                    graph.index.outpoints().iter().cloned(),
+                )
                 .collect::<Vec<_>>();
 
             let utxos = graph
                 .graph()
-                .filter_chain_unspents(&local_chain, chain_tip, graph.index.outpoints())
+                .filter_chain_unspents(
+                    &local_chain,
+                    chain_tip,
+                    graph.index.outpoints().iter().cloned(),
+                )
                 .collect::<Vec<_>>();
 
             let balance = graph.graph().balance(
                 &local_chain,
                 chain_tip,
-                graph.index.outpoints(),
-                |_, spk: &Script| trusted_spks.contains(&spk.to_owned()),
+                graph.index.outpoints().iter().cloned(),
+                |_, spk: ScriptBuf| trusted_spks.contains(&spk),
             );
-
-            assert_eq!(txouts.len(), 5);
-            assert_eq!(utxos.len(), 4);
 
             let confirmed_txouts_txid = txouts
                 .iter()
@@ -340,23 +350,25 @@ fn test_list_owned_txouts() {
             balance,
         ) = fetch(0, &graph);
 
-        assert_eq!(confirmed_txouts_txid, [tx1.txid()].into());
+        // tx1 is a confirmed txout and is unspent
+        // tx4, tx5 are unconfirmed
+        assert_eq!(confirmed_txouts_txid, [tx1.compute_txid()].into());
         assert_eq!(
             unconfirmed_txouts_txid,
-            [tx2.txid(), tx3.txid(), tx4.txid(), tx5.txid()].into()
+            [tx4.compute_txid(), tx5.compute_txid()].into()
         );
 
-        assert_eq!(confirmed_utxos_txid, [tx1.txid()].into());
+        assert_eq!(confirmed_utxos_txid, [tx1.compute_txid()].into());
         assert_eq!(
             unconfirmed_utxos_txid,
-            [tx3.txid(), tx4.txid(), tx5.txid()].into()
+            [tx4.compute_txid(), tx5.compute_txid()].into()
         );
 
         assert_eq!(
             balance,
             Balance {
                 immature: Amount::from_sat(70000),          // immature coinbase
-                trusted_pending: Amount::from_sat(25000),   // tx3 + tx5
+                trusted_pending: Amount::from_sat(15000),   // tx5
                 untrusted_pending: Amount::from_sat(20000), // tx4
                 confirmed: Amount::ZERO                     // Nothing is confirmed yet
             }
@@ -374,26 +386,32 @@ fn test_list_owned_txouts() {
         ) = fetch(1, &graph);
 
         // tx2 gets into confirmed txout set
-        assert_eq!(confirmed_txouts_txid, [tx1.txid(), tx2.txid()].into());
+        assert_eq!(
+            confirmed_txouts_txid,
+            [tx1.compute_txid(), tx2.compute_txid()].into()
+        );
         assert_eq!(
             unconfirmed_txouts_txid,
-            [tx3.txid(), tx4.txid(), tx5.txid()].into()
+            [tx4.compute_txid(), tx5.compute_txid()].into()
         );
 
-        // tx2 doesn't get into confirmed utxos set
-        assert_eq!(confirmed_utxos_txid, [tx1.txid()].into());
+        // tx2 gets into confirmed utxos set
+        assert_eq!(
+            confirmed_utxos_txid,
+            [tx1.compute_txid(), tx2.compute_txid()].into()
+        );
         assert_eq!(
             unconfirmed_utxos_txid,
-            [tx3.txid(), tx4.txid(), tx5.txid()].into()
+            [tx4.compute_txid(), tx5.compute_txid()].into()
         );
 
         assert_eq!(
             balance,
             Balance {
                 immature: Amount::from_sat(70000),          // immature coinbase
-                trusted_pending: Amount::from_sat(25000),   // tx3 + tx5
+                trusted_pending: Amount::from_sat(15000),   // tx5
                 untrusted_pending: Amount::from_sat(20000), // tx4
-                confirmed: Amount::ZERO                     // Nothing is confirmed yet
+                confirmed: Amount::from_sat(30_000)         // tx2 got confirmed
             }
         );
     }
@@ -411,13 +429,22 @@ fn test_list_owned_txouts() {
         // tx3 now gets into the confirmed txout set
         assert_eq!(
             confirmed_txouts_txid,
-            [tx1.txid(), tx2.txid(), tx3.txid()].into()
+            [tx1.compute_txid(), tx2.compute_txid(), tx3.compute_txid()].into()
         );
-        assert_eq!(unconfirmed_txouts_txid, [tx4.txid(), tx5.txid()].into());
+        assert_eq!(
+            unconfirmed_txouts_txid,
+            [tx4.compute_txid(), tx5.compute_txid()].into()
+        );
 
         // tx3 also gets into confirmed utxo set
-        assert_eq!(confirmed_utxos_txid, [tx1.txid(), tx3.txid()].into());
-        assert_eq!(unconfirmed_utxos_txid, [tx4.txid(), tx5.txid()].into());
+        assert_eq!(
+            confirmed_utxos_txid,
+            [tx1.compute_txid(), tx3.compute_txid()].into()
+        );
+        assert_eq!(
+            unconfirmed_utxos_txid,
+            [tx4.compute_txid(), tx5.compute_txid()].into()
+        );
 
         assert_eq!(
             balance,
@@ -440,14 +467,24 @@ fn test_list_owned_txouts() {
             balance,
         ) = fetch(98, &graph);
 
+        // no change compared to block 2
         assert_eq!(
             confirmed_txouts_txid,
-            [tx1.txid(), tx2.txid(), tx3.txid()].into()
+            [tx1.compute_txid(), tx2.compute_txid(), tx3.compute_txid()].into()
         );
-        assert_eq!(unconfirmed_txouts_txid, [tx4.txid(), tx5.txid()].into());
+        assert_eq!(
+            unconfirmed_txouts_txid,
+            [tx4.compute_txid(), tx5.compute_txid()].into()
+        );
 
-        assert_eq!(confirmed_utxos_txid, [tx1.txid(), tx3.txid()].into());
-        assert_eq!(unconfirmed_utxos_txid, [tx4.txid(), tx5.txid()].into());
+        assert_eq!(
+            confirmed_utxos_txid,
+            [tx1.compute_txid(), tx3.compute_txid()].into()
+        );
+        assert_eq!(
+            unconfirmed_utxos_txid,
+            [tx4.compute_txid(), tx5.compute_txid()].into()
+        );
 
         // Coinbase is still immature
         assert_eq!(
@@ -456,14 +493,14 @@ fn test_list_owned_txouts() {
                 immature: Amount::from_sat(70000),          // immature coinbase
                 trusted_pending: Amount::from_sat(15000),   // tx5
                 untrusted_pending: Amount::from_sat(20000), // tx4
-                confirmed: Amount::from_sat(10000)          // tx1 got matured
+                confirmed: Amount::from_sat(10000)          // tx3 is confirmed
             }
         );
     }
 
     // AT Block 99
     {
-        let (_, _, _, _, balance) = fetch(100, &graph);
+        let (_, _, _, _, balance) = fetch(99, &graph);
 
         // Coinbase maturity hits
         assert_eq!(
@@ -476,4 +513,148 @@ fn test_list_owned_txouts() {
             }
         );
     }
+}
+
+/// Given a `LocalChain`, `IndexedTxGraph`, and a `Transaction`, when we insert some anchor
+/// (possibly non-canonical) and/or a last-seen timestamp into the graph, we expect the
+/// result of `get_chain_position` in these cases:
+///
+/// - tx with no anchors or last_seen has no `ChainPosition`
+/// - tx with any last_seen will be `Unconfirmed`
+/// - tx with an anchor in best chain will be `Confirmed`
+/// - tx with an anchor not in best chain (no last_seen) has no `ChainPosition`
+#[test]
+fn test_get_chain_position() {
+    use bdk_chain::local_chain::CheckPoint;
+    use bdk_chain::spk_txout::SpkTxOutIndex;
+    use bdk_chain::BlockId;
+
+    struct TestCase<A> {
+        name: &'static str,
+        tx: Transaction,
+        anchor: Option<A>,
+        last_seen: Option<u64>,
+        exp_pos: Option<ChainPosition<A>>,
+    }
+
+    // addr: bcrt1qc6fweuf4xjvz4x3gx3t9e0fh4hvqyu2qw4wvxm
+    let spk = ScriptBuf::from_hex("0014c692ecf13534982a9a2834565cbd37add8027140").unwrap();
+    let mut graph = IndexedTxGraph::new({
+        let mut index = SpkTxOutIndex::default();
+        let _ = index.insert_spk(0u32, spk.clone());
+        index
+    });
+
+    // Anchors to test
+    let blocks = vec![block_id!(0, "g"), block_id!(1, "A"), block_id!(2, "B")];
+
+    let cp = CheckPoint::from_block_ids(blocks.clone()).unwrap();
+    let chain = LocalChain::from_tip(cp).unwrap();
+
+    // The test will insert a transaction into the indexed tx graph
+    // along with any anchors and timestamps, then check the value
+    // returned by `get_chain_position`.
+    fn run(
+        chain: &LocalChain,
+        graph: &mut IndexedTxGraph<BlockId, SpkTxOutIndex<u32>>,
+        test: TestCase<BlockId>,
+    ) {
+        let TestCase {
+            name,
+            tx,
+            anchor,
+            last_seen,
+            exp_pos,
+        } = test;
+
+        // add data to graph
+        let txid = tx.compute_txid();
+        let _ = graph.insert_tx(tx);
+        if let Some(anchor) = anchor {
+            let _ = graph.insert_anchor(txid, anchor);
+        }
+        if let Some(seen_at) = last_seen {
+            let _ = graph.insert_seen_at(txid, seen_at);
+        }
+
+        // check chain position
+        let res = graph
+            .graph()
+            .get_chain_position(chain, chain.tip().block_id(), txid);
+        assert_eq!(
+            res.map(ChainPosition::cloned),
+            exp_pos,
+            "failed test case: {name}"
+        );
+    }
+
+    [
+        TestCase {
+            name: "tx no anchors or last_seen - no chain pos",
+            tx: Transaction {
+                output: vec![TxOut {
+                    value: Amount::ONE_BTC,
+                    script_pubkey: spk.clone(),
+                }],
+                ..common::new_tx(0)
+            },
+            anchor: None,
+            last_seen: None,
+            exp_pos: None,
+        },
+        TestCase {
+            name: "tx last_seen - unconfirmed",
+            tx: Transaction {
+                output: vec![TxOut {
+                    value: Amount::ONE_BTC,
+                    script_pubkey: spk.clone(),
+                }],
+                ..common::new_tx(1)
+            },
+            anchor: None,
+            last_seen: Some(2),
+            exp_pos: Some(ChainPosition::Unconfirmed(2)),
+        },
+        TestCase {
+            name: "tx anchor in best chain - confirmed",
+            tx: Transaction {
+                output: vec![TxOut {
+                    value: Amount::ONE_BTC,
+                    script_pubkey: spk.clone(),
+                }],
+                ..common::new_tx(2)
+            },
+            anchor: Some(blocks[1]),
+            last_seen: None,
+            exp_pos: Some(ChainPosition::Confirmed(blocks[1])),
+        },
+        TestCase {
+            name: "tx unknown anchor with last_seen - unconfirmed",
+            tx: Transaction {
+                output: vec![TxOut {
+                    value: Amount::ONE_BTC,
+                    script_pubkey: spk.clone(),
+                }],
+                ..common::new_tx(3)
+            },
+            anchor: Some(block_id!(2, "B'")),
+            last_seen: Some(2),
+            exp_pos: Some(ChainPosition::Unconfirmed(2)),
+        },
+        TestCase {
+            name: "tx unknown anchor - no chain pos",
+            tx: Transaction {
+                output: vec![TxOut {
+                    value: Amount::ONE_BTC,
+                    script_pubkey: spk.clone(),
+                }],
+                ..common::new_tx(4)
+            },
+            anchor: Some(block_id!(2, "B'")),
+            last_seen: None,
+            exp_pos: None,
+        },
+    ]
+    .into_iter()
+    .for_each(|t| run(&chain, &mut graph, t));
 }

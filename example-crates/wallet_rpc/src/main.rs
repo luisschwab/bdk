@@ -2,10 +2,10 @@ use bdk_bitcoind_rpc::{
     bitcoincore_rpc::{Auth, Client, RpcApi},
     Emitter,
 };
-use bdk_file_store::Store;
 use bdk_wallet::{
     bitcoin::{Block, Network, Transaction},
-    wallet::Wallet,
+    file_store::Store,
+    Wallet,
 };
 use clap::{self, Parser};
 use std::{path::PathBuf, sync::mpsc::sync_channel, thread::spawn, time::Instant};
@@ -25,7 +25,7 @@ pub struct Args {
     pub descriptor: String,
     /// Wallet change descriptor
     #[clap(env = "CHANGE_DESCRIPTOR")]
-    pub change_descriptor: Option<String>,
+    pub change_descriptor: String,
     /// Earliest block height to start sync from
     #[clap(env = "START_HEIGHT", long, default_value = "481824")]
     pub start_height: u32,
@@ -86,21 +86,24 @@ fn main() -> anyhow::Result<()> {
     );
 
     let start_load_wallet = Instant::now();
-    let mut wallet = Wallet::new_or_load(
-        &args.descriptor,
-        args.change_descriptor.as_ref(),
-        Store::<bdk_wallet::wallet::ChangeSet>::open_or_create_new(
-            DB_MAGIC.as_bytes(),
-            args.db_path,
-        )?,
-        args.network,
-    )?;
+    let mut db =
+        Store::<bdk_wallet::ChangeSet>::open_or_create_new(DB_MAGIC.as_bytes(), args.db_path)?;
+    let wallet_opt = Wallet::load()
+        .descriptors(args.descriptor.clone(), args.change_descriptor.clone())
+        .network(args.network)
+        .load_wallet(&mut db)?;
+    let mut wallet = match wallet_opt {
+        Some(wallet) => wallet,
+        None => Wallet::create(args.descriptor, args.change_descriptor)
+            .network(args.network)
+            .create_wallet(&mut db)?,
+    };
     println!(
         "Loaded wallet in {}s",
         start_load_wallet.elapsed().as_secs_f32()
     );
 
-    let balance = wallet.get_balance();
+    let balance = wallet.balance();
     println!("Wallet balance before syncing: {} sats", balance.total());
 
     let wallet_tip = wallet.latest_checkpoint();
@@ -143,7 +146,7 @@ fn main() -> anyhow::Result<()> {
                 let connected_to = block_emission.connected_to();
                 let start_apply_block = Instant::now();
                 wallet.apply_block_connected_to(&block_emission.block, height, connected_to)?;
-                wallet.commit()?;
+                wallet.persist(&mut db)?;
                 let elapsed = start_apply_block.elapsed().as_secs_f32();
                 println!(
                     "Applied block {} at height {} in {}s",
@@ -153,7 +156,7 @@ fn main() -> anyhow::Result<()> {
             Emission::Mempool(mempool_emission) => {
                 let start_apply_mempool = Instant::now();
                 wallet.apply_unconfirmed_txs(mempool_emission.iter().map(|(tx, time)| (tx, *time)));
-                wallet.commit()?;
+                wallet.persist(&mut db)?;
                 println!(
                     "Applied unconfirmed transactions in {}s",
                     start_apply_mempool.elapsed().as_secs_f32()
@@ -163,7 +166,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
     let wallet_tip_end = wallet.latest_checkpoint();
-    let balance = wallet.get_balance();
+    let balance = wallet.balance();
     println!(
         "Synced {} blocks in {}s",
         blocks_received,

@@ -20,7 +20,7 @@
 //! ```
 //! # use std::str::FromStr;
 //! # use bitcoin::*;
-//! # use bdk_wallet::wallet::export::*;
+//! # use bdk_wallet::export::*;
 //! # use bdk_wallet::*;
 //! let import = r#"{
 //!     "descriptor": "wpkh([c258d2e4\/84h\/1h\/0h]tpubDD3ynpHgJQW8VvWRzQ5WFDCrs4jqVFGHB3vLC3r49XHJSqP8bHKdK4AriuUKLccK68zfzowx7YhmDN8SiSkgCDENUFx9qVw65YyqM78vyVe\/0\/*)",
@@ -29,24 +29,26 @@
 //! }"#;
 //!
 //! let import = FullyNodedExport::from_str(import)?;
-//! let wallet = Wallet::new_no_persist(
-//!     &import.descriptor(),
-//!     import.change_descriptor().as_ref(),
-//!     Network::Testnet,
-//! )?;
+//! let wallet = Wallet::create(
+//!     import.descriptor(),
+//!     import.change_descriptor().expect("change descriptor"),
+//! )
+//! .network(Network::Testnet)
+//! .create_wallet_no_persist()?;
 //! # Ok::<_, Box<dyn std::error::Error>>(())
 //! ```
 //!
 //! ### Export a `Wallet`
 //! ```
 //! # use bitcoin::*;
-//! # use bdk_wallet::wallet::export::*;
+//! # use bdk_wallet::export::*;
 //! # use bdk_wallet::*;
-//! let wallet = Wallet::new_no_persist(
+//! let wallet = Wallet::create(
 //!     "wpkh([c258d2e4/84h/1h/0h]tpubDD3ynpHgJQW8VvWRzQ5WFDCrs4jqVFGHB3vLC3r49XHJSqP8bHKdK4AriuUKLccK68zfzowx7YhmDN8SiSkgCDENUFx9qVw65YyqM78vyVe/0/*)",
-//!     Some("wpkh([c258d2e4/84h/1h/0h]tpubDD3ynpHgJQW8VvWRzQ5WFDCrs4jqVFGHB3vLC3r49XHJSqP8bHKdK4AriuUKLccK68zfzowx7YhmDN8SiSkgCDENUFx9qVw65YyqM78vyVe/1/*)"),
-//!     Network::Testnet,
-//! )?;
+//!     "wpkh([c258d2e4/84h/1h/0h]tpubDD3ynpHgJQW8VvWRzQ5WFDCrs4jqVFGHB3vLC3r49XHJSqP8bHKdK4AriuUKLccK68zfzowx7YhmDN8SiSkgCDENUFx9qVw65YyqM78vyVe/1/*)",
+//! )
+//! .network(Network::Testnet)
+//! .create_wallet_no_persist()?;
 //! let export = FullyNodedExport::export_wallet(&wallet, "exported wallet", true).unwrap();
 //!
 //! println!("Exported: {}", export.to_string());
@@ -116,7 +118,7 @@ impl FullyNodedExport {
         include_blockheight: bool,
     ) -> Result<Self, &'static str> {
         let descriptor = wallet
-            .get_descriptor_for_keychain(KeychainKind::External)
+            .public_descriptor(KeychainKind::External)
             .to_string_with_secret(
                 &wallet
                     .get_signers(KeychainKind::External)
@@ -128,7 +130,7 @@ impl FullyNodedExport {
         let blockheight = if include_blockheight {
             wallet.transactions().next().map_or(0, |canonical_tx| {
                 match canonical_tx.chain_position {
-                    bdk_chain::ChainPosition::Confirmed(a) => a.confirmation_height,
+                    bdk_chain::ChainPosition::Confirmed(a) => a.block_id.height,
                     bdk_chain::ChainPosition::Unconfirmed(_) => 0,
                 }
             })
@@ -142,19 +144,17 @@ impl FullyNodedExport {
             blockheight,
         };
 
-        let change_descriptor = match wallet.public_descriptor(KeychainKind::Internal).is_some() {
-            false => None,
-            true => {
-                let descriptor = wallet
-                    .get_descriptor_for_keychain(KeychainKind::Internal)
-                    .to_string_with_secret(
-                        &wallet
-                            .get_signers(KeychainKind::Internal)
-                            .as_key_map(wallet.secp_ctx()),
-                    );
-                Some(remove_checksum(descriptor))
-            }
+        let change_descriptor = {
+            let descriptor = wallet
+                .public_descriptor(KeychainKind::Internal)
+                .to_string_with_secret(
+                    &wallet
+                        .get_signers(KeychainKind::Internal)
+                        .as_key_map(wallet.secp_ctx()),
+                );
+            Some(remove_checksum(descriptor))
         };
+
         if export.change_descriptor() != change_descriptor {
             return Err("Incompatible change descriptor");
         }
@@ -166,7 +166,7 @@ impl FullyNodedExport {
         fn check_ms<Ctx: ScriptContext>(
             terminal: &Terminal<String, Ctx>,
         ) -> Result<(), &'static str> {
-            if let Terminal::Multi(_, _) = terminal {
+            if let Terminal::Multi(_) = terminal {
                 Ok(())
             } else {
                 Err("The descriptor contains operators not supported by Bitcoin Core")
@@ -216,39 +216,50 @@ mod test {
     use core::str::FromStr;
 
     use crate::std::string::ToString;
-    use bdk_chain::{BlockId, ConfirmationTime};
+    use bdk_chain::{BlockId, ConfirmationBlockTime};
     use bitcoin::hashes::Hash;
     use bitcoin::{transaction, BlockHash, Network, Transaction};
 
     use super::*;
-    use crate::wallet::Wallet;
+    use crate::Wallet;
 
-    fn get_test_wallet(
-        descriptor: &str,
-        change_descriptor: Option<&str>,
-        network: Network,
-    ) -> Wallet {
-        let mut wallet = Wallet::new_no_persist(descriptor, change_descriptor, network).unwrap();
+    fn get_test_wallet(descriptor: &str, change_descriptor: &str, network: Network) -> Wallet {
+        use crate::wallet::Update;
+        use bdk_chain::TxGraph;
+        let mut wallet = Wallet::create(descriptor.to_string(), change_descriptor.to_string())
+            .network(network)
+            .create_wallet_no_persist()
+            .expect("must create wallet");
         let transaction = Transaction {
             input: vec![],
             output: vec![],
             version: transaction::Version::non_standard(0),
             lock_time: bitcoin::absolute::LockTime::ZERO,
         };
+        let txid = transaction.compute_txid();
+        let block_id = BlockId {
+            height: 5000,
+            hash: BlockHash::all_zeros(),
+        };
+        wallet.insert_checkpoint(block_id).unwrap();
         wallet
             .insert_checkpoint(BlockId {
                 height: 5001,
                 hash: BlockHash::all_zeros(),
             })
             .unwrap();
+        wallet.insert_tx(transaction);
+        let anchor = ConfirmationBlockTime {
+            confirmation_time: 0,
+            block_id,
+        };
+        let mut graph = TxGraph::default();
+        let _ = graph.insert_anchor(txid, anchor);
         wallet
-            .insert_tx(
-                transaction,
-                ConfirmationTime::Confirmed {
-                    height: 5000,
-                    time: 0,
-                },
-            )
+            .apply_update(Update {
+                graph,
+                ..Default::default()
+            })
             .unwrap();
         wallet
     }
@@ -258,7 +269,7 @@ mod test {
         let descriptor = "wpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/44'/0'/0'/0/*)";
         let change_descriptor = "wpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/44'/0'/0'/1/*)";
 
-        let wallet = get_test_wallet(descriptor, Some(change_descriptor), Network::Bitcoin);
+        let wallet = get_test_wallet(descriptor, change_descriptor, Network::Bitcoin);
         let export = FullyNodedExport::export_wallet(&wallet, "Test Label", true).unwrap();
 
         assert_eq!(export.descriptor(), descriptor);
@@ -270,13 +281,14 @@ mod test {
     #[test]
     #[should_panic(expected = "Incompatible change descriptor")]
     fn test_export_no_change() {
-        // This wallet explicitly doesn't have a change descriptor. It should be impossible to
+        // The wallet's change descriptor has no wildcard. It should be impossible to
         // export, because exporting this kind of external descriptor normally implies the
-        // existence of an internal descriptor
+        // existence of a compatible internal descriptor
 
         let descriptor = "wpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/44'/0'/0'/0/*)";
+        let change_descriptor = "wpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/44'/0'/0'/1/0)";
 
-        let wallet = get_test_wallet(descriptor, None, Network::Bitcoin);
+        let wallet = get_test_wallet(descriptor, change_descriptor, Network::Bitcoin);
         FullyNodedExport::export_wallet(&wallet, "Test Label", true).unwrap();
     }
 
@@ -289,7 +301,7 @@ mod test {
         let descriptor = "wpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/44'/0'/0'/0/*)";
         let change_descriptor = "wpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/50'/0'/1/*)";
 
-        let wallet = get_test_wallet(descriptor, Some(change_descriptor), Network::Bitcoin);
+        let wallet = get_test_wallet(descriptor, change_descriptor, Network::Bitcoin);
         FullyNodedExport::export_wallet(&wallet, "Test Label", true).unwrap();
     }
 
@@ -306,7 +318,7 @@ mod test {
                                        [c98b1535/48'/0'/0'/2']tpubDCDi5W4sP6zSnzJeowy8rQDVhBdRARaPhK1axABi8V1661wEPeanpEXj4ZLAUEoikVtoWcyK26TKKJSecSfeKxwHCcRrge9k1ybuiL71z4a/1/*\
                                  ))";
 
-        let wallet = get_test_wallet(descriptor, Some(change_descriptor), Network::Testnet);
+        let wallet = get_test_wallet(descriptor, change_descriptor, Network::Testnet);
         let export = FullyNodedExport::export_wallet(&wallet, "Test Label", true).unwrap();
 
         assert_eq!(export.descriptor(), descriptor);
@@ -319,7 +331,7 @@ mod test {
     fn test_export_tr() {
         let descriptor = "tr([73c5da0a/86'/0'/0']tprv8fMn4hSKPRC1oaCPqxDb1JWtgkpeiQvZhsr8W2xuy3GEMkzoArcAWTfJxYb6Wj8XNNDWEjfYKK4wGQXh3ZUXhDF2NcnsALpWTeSwarJt7Vc/0/*)";
         let change_descriptor = "tr([73c5da0a/86'/0'/0']tprv8fMn4hSKPRC1oaCPqxDb1JWtgkpeiQvZhsr8W2xuy3GEMkzoArcAWTfJxYb6Wj8XNNDWEjfYKK4wGQXh3ZUXhDF2NcnsALpWTeSwarJt7Vc/1/*)";
-        let wallet = get_test_wallet(descriptor, Some(change_descriptor), Network::Testnet);
+        let wallet = get_test_wallet(descriptor, change_descriptor, Network::Testnet);
         let export = FullyNodedExport::export_wallet(&wallet, "Test Label", true).unwrap();
         assert_eq!(export.descriptor(), descriptor);
         assert_eq!(export.change_descriptor(), Some(change_descriptor.into()));
@@ -332,7 +344,7 @@ mod test {
         let descriptor = "wpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/44'/0'/0'/0/*)";
         let change_descriptor = "wpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/44'/0'/0'/1/*)";
 
-        let wallet = get_test_wallet(descriptor, Some(change_descriptor), Network::Bitcoin);
+        let wallet = get_test_wallet(descriptor, change_descriptor, Network::Bitcoin);
         let export = FullyNodedExport::export_wallet(&wallet, "Test Label", true).unwrap();
 
         assert_eq!(export.to_string(), "{\"descriptor\":\"wpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/44\'/0\'/0\'/0/*)\",\"blockheight\":5000,\"label\":\"Test Label\"}");

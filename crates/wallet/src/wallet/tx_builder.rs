@@ -17,9 +17,8 @@
 //! # use std::str::FromStr;
 //! # use bitcoin::*;
 //! # use bdk_wallet::*;
-//! # use bdk_wallet::wallet::ChangeSet;
-//! # use bdk_wallet::wallet::error::CreateTxError;
-//! # use bdk_persist::PersistBackend;
+//! # use bdk_wallet::ChangeSet;
+//! # use bdk_wallet::error::CreateTxError;
 //! # use anyhow::Error;
 //! # let to_address = Address::from_str("2N4eQYCbKUHCCTUjBJeHcJp9ok6J2GZsTDt").unwrap().assume_checked();
 //! # let mut wallet = doctest_wallet!();
@@ -43,11 +42,18 @@ use alloc::{boxed::Box, rc::Rc, string::String, vec::Vec};
 use core::cell::RefCell;
 use core::fmt;
 
+use alloc::sync::Arc;
+
 use bitcoin::psbt::{self, Psbt};
 use bitcoin::script::PushBytes;
-use bitcoin::{absolute, Amount, FeeRate, OutPoint, ScriptBuf, Sequence, Transaction, Txid};
+use bitcoin::{
+    absolute, Amount, FeeRate, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
+    Weight,
+};
+use rand_core::RngCore;
 
 use super::coin_selection::CoinSelectionAlgorithm;
+use super::utils::shuffle_slice;
 use super::{CreateTxError, Wallet};
 use crate::collections::{BTreeMap, HashSet};
 use crate::{KeychainKind, LocalOutput, Utxo, WeightedUtxo};
@@ -63,12 +69,11 @@ use crate::{KeychainKind, LocalOutput, Utxo, WeightedUtxo};
 ///
 /// ```
 /// # use bdk_wallet::*;
-/// # use bdk_wallet::wallet::tx_builder::*;
+/// # use bdk_wallet::tx_builder::*;
 /// # use bitcoin::*;
 /// # use core::str::FromStr;
-/// # use bdk_wallet::wallet::ChangeSet;
-/// # use bdk_wallet::wallet::error::CreateTxError;
-/// # use bdk_persist::PersistBackend;
+/// # use bdk_wallet::ChangeSet;
+/// # use bdk_wallet::error::CreateTxError;
 /// # use anyhow::Error;
 /// # let mut wallet = doctest_wallet!();
 /// # let addr1 = Address::from_str("2N4eQYCbKUHCCTUjBJeHcJp9ok6J2GZsTDt").unwrap().assume_checked();
@@ -186,10 +191,10 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
     }
 
     /// Set an absolute fee
-    /// The fee_absolute method refers to the absolute transaction fee in satoshis (sats).
-    /// If anyone sets both the fee_absolute method and the fee_rate method,
-    /// the FeePolicy enum will be set by whichever method was called last,
-    /// as the FeeRate and FeeAmount are mutually exclusive.
+    /// The fee_absolute method refers to the absolute transaction fee in [`Amount`].
+    /// If anyone sets both the `fee_absolute` method and the `fee_rate` method,
+    /// the `FeePolicy` enum will be set by whichever method was called last,
+    /// as the [`FeeRate`] and `FeeAmount` are mutually exclusive.
     ///
     /// Note that this is really a minimum absolute fee -- it's possible to
     /// overshoot it slightly since adding a change output to drain the remaining
@@ -294,7 +299,7 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
                 .collect::<Result<Vec<_>, _>>()?;
 
             for utxo in utxos {
-                let descriptor = wallet.get_descriptor_for_keychain(utxo.keychain);
+                let descriptor = wallet.public_descriptor(utxo.keychain);
                 let satisfaction_weight = descriptor.max_weight_to_satisfy().unwrap();
                 self.params.utxos.push(WeightedUtxo {
                     satisfaction_weight,
@@ -364,7 +369,7 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
         &mut self,
         outpoint: OutPoint,
         psbt_input: psbt::Input,
-        satisfaction_weight: usize,
+        satisfaction_weight: Weight,
     ) -> Result<&mut Self, AddForeignUtxoError> {
         self.add_foreign_utxo_with_sequence(
             outpoint,
@@ -379,15 +384,15 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
         &mut self,
         outpoint: OutPoint,
         psbt_input: psbt::Input,
-        satisfaction_weight: usize,
+        satisfaction_weight: Weight,
         sequence: Sequence,
     ) -> Result<&mut Self, AddForeignUtxoError> {
         if psbt_input.witness_utxo.is_none() {
             match psbt_input.non_witness_utxo.as_ref() {
                 Some(tx) => {
-                    if tx.txid() != outpoint.txid {
+                    if tx.compute_txid() != outpoint.txid {
                         return Err(AddForeignUtxoError::InvalidTxid {
-                            input_txid: tx.txid(),
+                            input_txid: tx.compute_txid(),
                             foreign_utxo: outpoint,
                         });
                     }
@@ -636,9 +641,8 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
     /// # use std::str::FromStr;
     /// # use bitcoin::*;
     /// # use bdk_wallet::*;
-    /// # use bdk_wallet::wallet::ChangeSet;
-    /// # use bdk_wallet::wallet::error::CreateTxError;
-    /// # use bdk_persist::PersistBackend;
+    /// # use bdk_wallet::ChangeSet;
+    /// # use bdk_wallet::error::CreateTxError;
     /// # use anyhow::Error;
     /// # let to_address =
     /// Address::from_str("2N4eQYCbKUHCCTUjBJeHcJp9ok6J2GZsTDt")
@@ -670,13 +674,33 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
 impl<'a, Cs: CoinSelectionAlgorithm> TxBuilder<'a, Cs> {
     /// Finish building the transaction.
     ///
+    /// Uses the thread-local random number generator (rng).
+    ///
     /// Returns a new [`Psbt`] per [`BIP174`].
     ///
     /// [`BIP174`]: https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki
+    ///
+    /// **WARNING**: To avoid change address reuse you must persist the changes resulting from one
+    /// or more calls to this method before closing the wallet. See [`Wallet::reveal_next_address`].
+    #[cfg(feature = "std")]
     pub fn finish(self) -> Result<Psbt, CreateTxError> {
+        self.finish_with_aux_rand(&mut bitcoin::key::rand::thread_rng())
+    }
+
+    /// Finish building the transaction.
+    ///
+    /// Uses a provided random number generator (rng).
+    ///
+    /// Returns a new [`Psbt`] per [`BIP174`].
+    ///
+    /// [`BIP174`]: https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki
+    ///
+    /// **WARNING**: To avoid change address reuse you must persist the changes resulting from one
+    /// or more calls to this method before closing the wallet. See [`Wallet::reveal_next_address`].
+    pub fn finish_with_aux_rand(self, rng: &mut impl RngCore) -> Result<Psbt, CreateTxError> {
         self.wallet
             .borrow_mut()
-            .create_tx(self.coin_selection, self.params)
+            .create_tx(self.coin_selection, self.params, rng)
     }
 }
 
@@ -742,35 +766,60 @@ impl fmt::Display for AddForeignUtxoError {
 #[cfg(feature = "std")]
 impl std::error::Error for AddForeignUtxoError {}
 
+type TxSort<T> = dyn Fn(&T, &T) -> core::cmp::Ordering;
+
 /// Ordering of the transaction's inputs and outputs
-#[derive(Default, Debug, Ord, PartialOrd, Eq, PartialEq, Hash, Clone, Copy)]
+#[derive(Clone, Default)]
 pub enum TxOrdering {
     /// Randomized (default)
     #[default]
     Shuffle,
     /// Unchanged
     Untouched,
-    /// BIP69 / Lexicographic
-    Bip69Lexicographic,
+    /// Provide custom comparison functions for sorting
+    Custom {
+        /// Transaction inputs sort function
+        input_sort: Arc<TxSort<TxIn>>,
+        /// Transaction outputs sort function
+        output_sort: Arc<TxSort<TxOut>>,
+    },
+}
+
+impl core::fmt::Debug for TxOrdering {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self {
+            TxOrdering::Shuffle => write!(f, "Shuffle"),
+            TxOrdering::Untouched => write!(f, "Untouched"),
+            TxOrdering::Custom { .. } => write!(f, "Custom"),
+        }
+    }
 }
 
 impl TxOrdering {
-    /// Sort transaction inputs and outputs by [`TxOrdering`] variant
+    /// Sort transaction inputs and outputs by [`TxOrdering`] variant.
+    ///
+    /// Uses the thread-local random number generator (rng).
+    #[cfg(feature = "std")]
     pub fn sort_tx(&self, tx: &mut Transaction) {
+        self.sort_tx_with_aux_rand(tx, &mut bitcoin::key::rand::thread_rng())
+    }
+
+    /// Sort transaction inputs and outputs by [`TxOrdering`] variant.
+    ///
+    /// Uses a provided random number generator (rng).
+    pub fn sort_tx_with_aux_rand(&self, tx: &mut Transaction, rng: &mut impl RngCore) {
         match self {
             TxOrdering::Untouched => {}
             TxOrdering::Shuffle => {
-                use rand::seq::SliceRandom;
-                let mut rng = rand::thread_rng();
-                tx.input.shuffle(&mut rng);
-                tx.output.shuffle(&mut rng);
+                shuffle_slice(&mut tx.input, rng);
+                shuffle_slice(&mut tx.output, rng);
             }
-            TxOrdering::Bip69Lexicographic => {
-                tx.input.sort_unstable_by_key(|txin| {
-                    (txin.previous_output.txid, txin.previous_output.vout)
-                });
-                tx.output
-                    .sort_unstable_by_key(|txout| (txout.value, txout.script_pubkey.clone()));
+            TxOrdering::Custom {
+                input_sort,
+                output_sort,
+            } => {
+                tx.input.sort_unstable_by(|a, b| input_sort(a, b));
+                tx.output.sort_unstable_by(|a, b| output_sort(a, b));
             }
         }
     }
@@ -849,12 +898,6 @@ mod test {
     use bitcoin::TxOut;
 
     use super::*;
-
-    #[test]
-    fn test_output_ordering_default_shuffle() {
-        assert_eq!(TxOrdering::default(), TxOrdering::Shuffle);
-    }
-
     #[test]
     fn test_output_ordering_untouched() {
         let original_tx = ordering_test_tx!();
@@ -887,13 +930,28 @@ mod test {
     }
 
     #[test]
-    fn test_output_ordering_bip69() {
+    fn test_output_ordering_custom_but_bip69() {
         use core::str::FromStr;
 
         let original_tx = ordering_test_tx!();
         let mut tx = original_tx;
 
-        TxOrdering::Bip69Lexicographic.sort_tx(&mut tx);
+        let bip69_txin_cmp = |tx_a: &TxIn, tx_b: &TxIn| {
+            let project_outpoint = |t: &TxIn| (t.previous_output.txid, t.previous_output.vout);
+            project_outpoint(tx_a).cmp(&project_outpoint(tx_b))
+        };
+
+        let bip69_txout_cmp = |tx_a: &TxOut, tx_b: &TxOut| {
+            let project_utxo = |t: &TxOut| (t.value, t.script_pubkey.clone());
+            project_utxo(tx_a).cmp(&project_utxo(tx_b))
+        };
+
+        let custom_bip69_ordering = TxOrdering::Custom {
+            input_sort: Arc::new(bip69_txin_cmp),
+            output_sort: Arc::new(bip69_txout_cmp),
+        };
+
+        custom_bip69_ordering.sort_tx(&mut tx);
 
         assert_eq!(
             tx.input[0].previous_output,
@@ -923,6 +981,63 @@ mod test {
             tx.output[2].script_pubkey,
             ScriptBuf::from(vec![0xAA, 0xEE])
         );
+    }
+
+    #[test]
+    fn test_output_ordering_custom_with_sha256() {
+        use bitcoin::hashes::{sha256, Hash};
+
+        let original_tx = ordering_test_tx!();
+        let mut tx_1 = original_tx.clone();
+        let mut tx_2 = original_tx.clone();
+        let shared_secret = "secret_tweak";
+
+        let hash_txin_with_shared_secret_seed = Arc::new(|tx_a: &TxIn, tx_b: &TxIn| {
+            let secret_digest_from_txin = |txin: &TxIn| {
+                sha256::Hash::hash(
+                    &[
+                        &txin.previous_output.txid.to_raw_hash()[..],
+                        &txin.previous_output.vout.to_be_bytes(),
+                        shared_secret.as_bytes(),
+                    ]
+                    .concat(),
+                )
+            };
+            secret_digest_from_txin(tx_a).cmp(&secret_digest_from_txin(tx_b))
+        });
+
+        let hash_txout_with_shared_secret_seed = Arc::new(|tx_a: &TxOut, tx_b: &TxOut| {
+            let secret_digest_from_txout = |txin: &TxOut| {
+                sha256::Hash::hash(
+                    &[
+                        &txin.value.to_sat().to_be_bytes(),
+                        &txin.script_pubkey.clone().into_bytes()[..],
+                        shared_secret.as_bytes(),
+                    ]
+                    .concat(),
+                )
+            };
+            secret_digest_from_txout(tx_a).cmp(&secret_digest_from_txout(tx_b))
+        });
+
+        let custom_ordering_from_salted_sha256_1 = TxOrdering::Custom {
+            input_sort: hash_txin_with_shared_secret_seed.clone(),
+            output_sort: hash_txout_with_shared_secret_seed.clone(),
+        };
+
+        let custom_ordering_from_salted_sha256_2 = TxOrdering::Custom {
+            input_sort: hash_txin_with_shared_secret_seed,
+            output_sort: hash_txout_with_shared_secret_seed,
+        };
+
+        custom_ordering_from_salted_sha256_1.sort_tx(&mut tx_1);
+        custom_ordering_from_salted_sha256_2.sort_tx(&mut tx_2);
+
+        // Check the ordering is consistent between calls
+        assert_eq!(tx_1, tx_2);
+        // Check transaction order has changed
+        assert_ne!(tx_1, original_tx);
+        assert_ne!(tx_2, original_tx);
     }
 
     fn get_test_utxos() -> Vec<LocalOutput> {

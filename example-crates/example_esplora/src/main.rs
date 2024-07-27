@@ -7,10 +7,10 @@ use std::{
 use bdk_chain::{
     bitcoin::{constants::genesis_block, Address, Network, Txid},
     indexed_tx_graph::{self, IndexedTxGraph},
-    keychain,
+    indexer::keychain_txout,
     local_chain::{self, LocalChain},
     spk_client::{FullScanRequest, SyncRequest},
-    Append, ConfirmationTimeHeightAnchor,
+    ConfirmationBlockTime, Merge,
 };
 
 use bdk_esplora::{esplora_client, EsploraExt};
@@ -22,11 +22,11 @@ use example_cli::{
 };
 
 const DB_MAGIC: &[u8] = b"bdk_example_esplora";
-const DB_PATH: &str = ".bdk_esplora_example.db";
+const DB_PATH: &str = "bdk_example_esplora.db";
 
 type ChangeSet = (
     local_chain::ChangeSet,
-    indexed_tx_graph::ChangeSet<ConfirmationTimeHeightAnchor, keychain::ChangeSet<Keychain>>,
+    indexed_tx_graph::ChangeSet<ConfirmationBlockTime, keychain_txout::ChangeSet>,
 );
 
 #[derive(Subcommand, Debug, Clone)]
@@ -84,7 +84,7 @@ impl EsploraArgs {
             Network::Bitcoin => "https://blockstream.info/api",
             Network::Testnet => "https://blockstream.info/testnet/api",
             Network::Regtest => "http://localhost:3002",
-            Network::Signet => "https://mempool.space/signet/api",
+            Network::Signet => "http://signet.bitcoindevkit.net",
             _ => panic!("unsupported network"),
         });
 
@@ -96,7 +96,7 @@ impl EsploraArgs {
 #[derive(Parser, Debug, Clone, PartialEq)]
 pub struct ScanOptions {
     /// Max number of concurrent esplora server requests.
-    #[clap(long, default_value = "1")]
+    #[clap(long, default_value = "5")]
     pub parallel_requests: usize,
 }
 
@@ -204,11 +204,11 @@ fn main() -> anyhow::Result<()> {
             // addresses derived so we need to derive up to last active addresses the scan found
             // before adding the transactions.
             (chain.apply_update(update.chain_update)?, {
-                let (_, index_changeset) = graph
+                let index_changeset = graph
                     .index
                     .reveal_to_target_multi(&update.last_active_indices);
                 let mut indexed_tx_graph_changeset = graph.apply_update(update.graph_update);
-                indexed_tx_graph_changeset.append(index_changeset.into());
+                indexed_tx_graph_changeset.merge(index_changeset.into());
                 indexed_tx_graph_changeset
             })
         }
@@ -245,7 +245,7 @@ fn main() -> anyhow::Result<()> {
                     let all_spks = graph
                         .index
                         .revealed_spks(..)
-                        .map(|(k, i, spk)| (k.to_owned(), i, spk.to_owned()))
+                        .map(|((k, i), spk)| (k, i, spk.to_owned()))
                         .collect::<Vec<_>>();
                     request = request.chain_spks(all_spks.into_iter().map(|(k, i, spk)| {
                         eprint!("scanning {}:{}", k, i);
@@ -258,10 +258,10 @@ fn main() -> anyhow::Result<()> {
                     let unused_spks = graph
                         .index
                         .unused_spks()
-                        .map(|(k, i, spk)| (k, i, spk.to_owned()))
+                        .map(|(index, spk)| (index, spk.to_owned()))
                         .collect::<Vec<_>>();
                     request =
-                        request.chain_spks(unused_spks.into_iter().map(move |(k, i, spk)| {
+                        request.chain_spks(unused_spks.into_iter().map(move |((k, i), spk)| {
                             eprint!(
                                 "Checking if address {} {}:{} has been used",
                                 Address::from_script(&spk, args.network).unwrap(),
@@ -280,7 +280,11 @@ fn main() -> anyhow::Result<()> {
                     let init_outpoints = graph.index.outpoints();
                     let utxos = graph
                         .graph()
-                        .filter_chain_unspents(&*chain, local_tip.block_id(), init_outpoints)
+                        .filter_chain_unspents(
+                            &*chain,
+                            local_tip.block_id(),
+                            init_outpoints.iter().cloned(),
+                        )
                         .map(|(_, utxo)| utxo)
                         .collect::<Vec<_>>();
                     request = request.chain_outpoints(
@@ -303,7 +307,7 @@ fn main() -> anyhow::Result<()> {
                     // `EsploraExt::update_tx_graph_without_keychain`.
                     let unconfirmed_txids = graph
                         .graph()
-                        .list_chain_txs(&*chain, local_tip.block_id())
+                        .list_canonical_txs(&*chain, local_tip.block_id())
                         .filter(|canonical_tx| !canonical_tx.chain_position.is_confirmed())
                         .map(|canonical_tx| canonical_tx.tx_node.txid)
                         .collect::<Vec<Txid>>();
@@ -357,7 +361,6 @@ fn main() -> anyhow::Result<()> {
 
     // We persist the changes
     let mut db = db.lock().unwrap();
-    db.stage((local_chain_changeset, indexed_tx_graph_changeset));
-    db.commit()?;
+    db.append_changeset(&(local_chain_changeset, indexed_tx_graph_changeset))?;
     Ok(())
 }

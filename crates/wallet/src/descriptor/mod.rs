@@ -112,6 +112,16 @@ impl IntoWalletDescriptor for &String {
     }
 }
 
+impl IntoWalletDescriptor for String {
+    fn into_wallet_descriptor(
+        self,
+        secp: &SecpCtx,
+        network: Network,
+    ) -> Result<(ExtendedDescriptor, KeyMap), DescriptorError> {
+        self.as_str().into_wallet_descriptor(secp, network)
+    }
+}
+
 impl IntoWalletDescriptor for ExtendedDescriptor {
     fn into_wallet_descriptor(
         self,
@@ -229,7 +239,7 @@ impl IntoWalletDescriptor for DescriptorTemplateOut {
                 let pk = match pk {
                     DescriptorPublicKey::XPub(ref xpub) => {
                         let mut xpub = xpub.clone();
-                        xpub.xkey.network = self.network;
+                        xpub.xkey.network = self.network.into();
 
                         DescriptorPublicKey::XPub(xpub)
                     }
@@ -264,11 +274,11 @@ impl IntoWalletDescriptor for DescriptorTemplateOut {
             .map(|(mut k, mut v)| {
                 match (&mut k, &mut v) {
                     (DescriptorPublicKey::XPub(xpub), DescriptorSecretKey::XPrv(xprv)) => {
-                        xpub.xkey.network = network;
-                        xprv.xkey.network = network;
+                        xpub.xkey.network = network.into();
+                        xprv.xkey.network = network.into();
                     }
                     (_, DescriptorSecretKey::Single(key)) => {
-                        key.key.network = network;
+                        key.key.network = network.into();
                     }
                     _ => {}
                 }
@@ -281,15 +291,10 @@ impl IntoWalletDescriptor for DescriptorTemplateOut {
     }
 }
 
-/// Wrapper for `IntoWalletDescriptor` that performs additional checks on the keys contained in the
-/// descriptor
-pub(crate) fn into_wallet_descriptor_checked<T: IntoWalletDescriptor>(
-    inner: T,
-    secp: &SecpCtx,
-    network: Network,
-) -> Result<(ExtendedDescriptor, KeyMap), DescriptorError> {
-    let (descriptor, keymap) = inner.into_wallet_descriptor(secp, network)?;
-
+/// Extra checks for [`ExtendedDescriptor`].
+pub(crate) fn check_wallet_descriptor(
+    descriptor: &Descriptor<DescriptorPublicKey>,
+) -> Result<(), DescriptorError> {
     // Ensure the keys don't contain any hardened derivation steps or hardened wildcards
     let descriptor_contains_hardened_steps = descriptor.for_any_key(|k| {
         if let DescriptorPublicKey::XPub(DescriptorXKey {
@@ -316,7 +321,7 @@ pub(crate) fn into_wallet_descriptor_checked<T: IntoWalletDescriptor>(
     // issues
     descriptor.sanity_check()?;
 
-    Ok((descriptor, keymap))
+    Ok(())
 }
 
 #[doc(hidden)]
@@ -606,8 +611,8 @@ mod test {
     use assert_matches::assert_matches;
     use bitcoin::hex::FromHex;
     use bitcoin::secp256k1::Secp256k1;
-    use bitcoin::ScriptBuf;
     use bitcoin::{bip32, Psbt};
+    use bitcoin::{NetworkKind, ScriptBuf};
 
     use super::*;
     use crate::psbt::PsbtUtils;
@@ -743,7 +748,7 @@ mod test {
             .unwrap();
 
         let mut xprv_testnet = xprv;
-        xprv_testnet.network = Network::Testnet;
+        xprv_testnet.network = NetworkKind::Test;
 
         let xpub_testnet = bip32::Xpub::from_priv(&secp, &xprv_testnet);
         let desc_pubkey = DescriptorPublicKey::XPub(DescriptorXKey {
@@ -855,22 +860,31 @@ mod test {
     }
 
     #[test]
-    fn test_into_wallet_descriptor_checked() {
+    fn test_check_wallet_descriptor() {
         let secp = Secp256k1::new();
 
         let descriptor = "wpkh(tpubD6NzVbkrYhZ4XHndKkuB8FifXm8r5FQHwrN6oZuWCz13qb93rtgKvD4PQsqC4HP4yhV3tA2fqr2RbY5mNXfM7RxXUoeABoDtsFUq2zJq6YK/0'/1/2/*)";
-        let result = into_wallet_descriptor_checked(descriptor, &secp, Network::Testnet);
+        let (descriptor, _) = descriptor
+            .into_wallet_descriptor(&secp, Network::Testnet)
+            .expect("must parse");
+        let result = check_wallet_descriptor(&descriptor);
 
         assert_matches!(result, Err(DescriptorError::HardenedDerivationXpub));
 
         let descriptor = "wpkh(tpubD6NzVbkrYhZ4XHndKkuB8FifXm8r5FQHwrN6oZuWCz13qb93rtgKvD4PQsqC4HP4yhV3tA2fqr2RbY5mNXfM7RxXUoeABoDtsFUq2zJq6YK/<0;1>/*)";
-        let result = into_wallet_descriptor_checked(descriptor, &secp, Network::Testnet);
+        let (descriptor, _) = descriptor
+            .into_wallet_descriptor(&secp, Network::Testnet)
+            .expect("must parse");
+        let result = check_wallet_descriptor(&descriptor);
 
         assert_matches!(result, Err(DescriptorError::MultiPath));
 
         // repeated pubkeys
         let descriptor = "wsh(multi(2,tpubD6NzVbkrYhZ4XHndKkuB8FifXm8r5FQHwrN6oZuWCz13qb93rtgKvD4PQsqC4HP4yhV3tA2fqr2RbY5mNXfM7RxXUoeABoDtsFUq2zJq6YK/0/*,tpubD6NzVbkrYhZ4XHndKkuB8FifXm8r5FQHwrN6oZuWCz13qb93rtgKvD4PQsqC4HP4yhV3tA2fqr2RbY5mNXfM7RxXUoeABoDtsFUq2zJq6YK/0/*))";
-        let result = into_wallet_descriptor_checked(descriptor, &secp, Network::Testnet);
+        let (descriptor, _) = descriptor
+            .into_wallet_descriptor(&secp, Network::Testnet)
+            .expect("must parse");
+        let result = check_wallet_descriptor(&descriptor);
 
         assert!(result.is_err());
     }
@@ -882,8 +896,10 @@ mod test {
         let secp = Secp256k1::new();
 
         let descriptor = "sh(wsh(sortedmulti(3,tpubDEsqS36T4DVsKJd9UH8pAKzrkGBYPLEt9jZMwpKtzh1G6mgYehfHt9WCgk7MJG5QGSFWf176KaBNoXbcuFcuadAFKxDpUdMDKGBha7bY3QM/0/*,tpubDF3cpwfs7fMvXXuoQbohXtLjNM6ehwYT287LWtmLsd4r77YLg6MZg4vTETx5MSJ2zkfigbYWu31VA2Z2Vc1cZugCYXgS7FQu6pE8V6TriEH/0/*,tpubDE1SKfcW76Tb2AASv5bQWMuScYNAdoqLHoexw13sNDXwmUhQDBbCD3QAedKGLhxMrWQdMDKENzYtnXPDRvexQPNuDrLj52wAjHhNEm8sJ4p/0/*,tpubDFLc6oXwJmhm3FGGzXkfJNTh2KitoY3WhmmQvuAjMhD8YbyWn5mAqckbxXfm2etM3p5J6JoTpSrMqRSTfMLtNW46poDaEZJ1kjd3csRSjwH/0/*,tpubDEWD9NBeWP59xXmdqSNt4VYdtTGwbpyP8WS962BuqpQeMZmX9Pur14dhXdZT5a7wR1pK6dPtZ9fP5WR493hPzemnBvkfLLYxnUjAKj1JCQV/0/*,tpubDEHyZkkwd7gZWCTgQuYQ9C4myF2hMEmyHsBCCmLssGqoqUxeT3gzohF5uEVURkf9TtmeepJgkSUmteac38FwZqirjApzNX59XSHLcwaTZCH/0/*,tpubDEqLouCekwnMUWN486kxGzD44qVgeyuqHyxUypNEiQt5RnUZNJe386TKPK99fqRV1vRkZjYAjtXGTECz98MCsdLcnkM67U6KdYRzVubeCgZ/0/*)))";
-        let (descriptor, _) =
-            into_wallet_descriptor_checked(descriptor, &secp, Network::Testnet).unwrap();
+        let (descriptor, _) = descriptor
+            .into_wallet_descriptor(&secp, Network::Testnet)
+            .unwrap();
+        check_wallet_descriptor(&descriptor).expect("descriptor");
 
         let descriptor = descriptor.at_derivation_index(0).unwrap();
 

@@ -1,4 +1,4 @@
-use bdk_chain::{indexed_tx_graph::Indexer, SpkTxOutIndex};
+use bdk_chain::{spk_txout::SpkTxOutIndex, Indexer};
 use bitcoin::{
     absolute, transaction, Amount, OutPoint, ScriptBuf, SignedAmount, Transaction, TxIn, TxOut,
 };
@@ -47,7 +47,7 @@ fn spk_txout_sent_and_received() {
         lock_time: absolute::LockTime::ZERO,
         input: vec![TxIn {
             previous_output: OutPoint {
-                txid: tx1.txid(),
+                txid: tx1.compute_txid(),
                 vout: 0,
             },
             ..Default::default()

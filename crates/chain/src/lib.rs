@@ -21,13 +21,15 @@
 #![warn(missing_docs)]
 
 pub use bitcoin;
-mod spk_txout_index;
-pub use spk_txout_index::*;
+mod balance;
+pub use balance::*;
 mod chain_data;
 pub use chain_data::*;
 pub mod indexed_tx_graph;
 pub use indexed_tx_graph::IndexedTxGraph;
-pub mod keychain;
+pub mod indexer;
+pub use indexer::spk_txout;
+pub use indexer::Indexer;
 pub mod local_chain;
 mod tx_data_traits;
 pub mod tx_graph;
@@ -35,6 +37,8 @@ pub use tx_data_traits::*;
 pub use tx_graph::TxGraph;
 mod chain_oracle;
 pub use chain_oracle::*;
+mod persist;
+pub use persist::*;
 
 #[doc(hidden)]
 pub mod example_utils;
@@ -48,13 +52,18 @@ pub use descriptor_ext::{DescriptorExt, DescriptorId};
 #[cfg(feature = "miniscript")]
 mod spk_iter;
 #[cfg(feature = "miniscript")]
+pub use indexer::keychain_txout;
+#[cfg(feature = "miniscript")]
 pub use spk_iter::*;
+#[cfg(feature = "rusqlite")]
+pub mod rusqlite_impl;
 pub mod spk_client;
 
 #[allow(unused_imports)]
 #[macro_use]
 extern crate alloc;
-
+#[cfg(feature = "rusqlite")]
+pub extern crate rusqlite_crate as rusqlite;
 #[cfg(feature = "serde")]
 pub extern crate serde_crate as serde;
 
@@ -95,3 +104,25 @@ pub mod collections {
 
 /// How many confirmations are needed f or a coinbase output to be spent.
 pub const COINBASE_MATURITY: u32 = 100;
+
+/// A tuple of keychain index and `T` representing the indexed value.
+pub type Indexed<T> = (u32, T);
+/// A tuple of keychain `K`, derivation index (`u32`) and a `T` associated with them.
+pub type KeychainIndexed<K, T> = ((K, u32), T);
+
+/// A wrapper that we use to impl remote traits for types in our crate or dependency crates.
+pub struct Impl<T>(pub T);
+
+impl<T> From<T> for Impl<T> {
+    fn from(value: T) -> Self {
+        Self(value)
+    }
+}
+
+impl<T> core::ops::Deref for Impl<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}

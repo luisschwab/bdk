@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use bdk_bitcoind_rpc::Emitter;
 use bdk_chain::{
     bitcoin::{Address, Amount, Txid},
-    keychain::Balance,
     local_chain::{CheckPoint, LocalChain},
-    Append, BlockId, IndexedTxGraph, SpkTxOutIndex,
+    spk_txout::SpkTxOutIndex,
+    Balance, BlockId, IndexedTxGraph, Merge,
 };
 use bdk_testenv::{anyhow, TestEnv};
 use bitcoin::{hashes::Hash, Block, OutPoint, ScriptBuf, WScriptHash};
@@ -48,7 +48,7 @@ pub fn test_sync_local_chain() -> anyhow::Result<()> {
 
         assert_eq!(
             local_chain.apply_update(emission.checkpoint,)?,
-            BTreeMap::from([(height, Some(hash))]),
+            [(height, Some(hash))].into(),
             "chain update changeset is unexpected",
         );
     }
@@ -94,11 +94,13 @@ pub fn test_sync_local_chain() -> anyhow::Result<()> {
         assert_eq!(
             local_chain.apply_update(emission.checkpoint,)?,
             if exp_height == exp_hashes.len() - reorged_blocks.len() {
-                core::iter::once((height, Some(hash)))
-                    .chain((height + 1..exp_hashes.len() as u32).map(|h| (h, None)))
-                    .collect::<bdk_chain::local_chain::ChangeSet>()
+                bdk_chain::local_chain::ChangeSet {
+                    blocks: core::iter::once((height, Some(hash)))
+                        .chain((height + 1..exp_hashes.len() as u32).map(|h| (h, None)))
+                        .collect(),
+                }
             } else {
-                BTreeMap::from([(height, Some(hash))])
+                [(height, Some(hash))].into()
             },
             "chain update changeset is unexpected",
         );
@@ -194,15 +196,15 @@ fn test_into_tx_graph() -> anyhow::Result<()> {
         let indexed_additions = indexed_tx_graph.batch_insert_unconfirmed(mempool_txs);
         assert_eq!(
             indexed_additions
-                .graph
+                .tx_graph
                 .txs
                 .iter()
-                .map(|tx| tx.txid())
+                .map(|tx| tx.compute_txid())
                 .collect::<BTreeSet<Txid>>(),
             exp_txids,
             "changeset should have the 3 mempool transactions",
         );
-        assert!(indexed_additions.graph.anchors.is_empty());
+        assert!(indexed_additions.tx_graph.anchors.is_empty());
     }
 
     // mine a block that confirms the 3 txs
@@ -225,9 +227,9 @@ fn test_into_tx_graph() -> anyhow::Result<()> {
         let height = emission.block_height();
         let _ = chain.apply_update(emission.checkpoint)?;
         let indexed_additions = indexed_tx_graph.apply_block_relevant(&emission.block, height);
-        assert!(indexed_additions.graph.txs.is_empty());
-        assert!(indexed_additions.graph.txouts.is_empty());
-        assert_eq!(indexed_additions.graph.anchors, exp_anchors);
+        assert!(indexed_additions.tx_graph.txs.is_empty());
+        assert!(indexed_additions.tx_graph.txouts.is_empty());
+        assert_eq!(indexed_additions.tx_graph.anchors, exp_anchors);
     }
 
     Ok(())
@@ -392,7 +394,6 @@ fn tx_can_become_unconfirmed_after_reorg() -> anyhow::Result<()> {
             get_balance(&recv_chain, &recv_graph)?,
             Balance {
                 confirmed: SEND_AMOUNT * (ADDITIONAL_COUNT - reorg_count) as u64,
-                trusted_pending: SEND_AMOUNT * reorg_count as u64,
                 ..Balance::default()
             },
             "reorg_count: {}",
@@ -440,7 +441,7 @@ fn mempool_avoids_re_emission() -> anyhow::Result<()> {
     let emitted_txids = emitter
         .mempool()?
         .into_iter()
-        .map(|(tx, _)| tx.txid())
+        .map(|(tx, _)| tx.compute_txid())
         .collect::<BTreeSet<Txid>>();
     assert_eq!(
         emitted_txids, exp_txids,
@@ -509,7 +510,7 @@ fn mempool_re_emits_if_tx_introduction_height_not_reached() -> anyhow::Result<()
         emitter
             .mempool()?
             .into_iter()
-            .map(|(tx, _)| tx.txid())
+            .map(|(tx, _)| tx.compute_txid())
             .collect::<BTreeSet<_>>(),
         tx_introductions.iter().map(|&(_, txid)| txid).collect(),
         "first mempool emission should include all txs",
@@ -518,7 +519,7 @@ fn mempool_re_emits_if_tx_introduction_height_not_reached() -> anyhow::Result<()
         emitter
             .mempool()?
             .into_iter()
-            .map(|(tx, _)| tx.txid())
+            .map(|(tx, _)| tx.compute_txid())
             .collect::<BTreeSet<_>>(),
         tx_introductions.iter().map(|&(_, txid)| txid).collect(),
         "second mempool emission should still include all txs",
@@ -538,7 +539,7 @@ fn mempool_re_emits_if_tx_introduction_height_not_reached() -> anyhow::Result<()
             let emitted_txids = emitter
                 .mempool()?
                 .into_iter()
-                .map(|(tx, _)| tx.txid())
+                .map(|(tx, _)| tx.compute_txid())
                 .collect::<BTreeSet<_>>();
             assert_eq!(
                 emitted_txids, exp_txids,
@@ -596,7 +597,7 @@ fn mempool_during_reorg() -> anyhow::Result<()> {
         emitter
             .mempool()?
             .into_iter()
-            .map(|(tx, _)| tx.txid())
+            .map(|(tx, _)| tx.compute_txid())
             .collect::<BTreeSet<_>>(),
         env.rpc_client()
             .get_raw_mempool()?
@@ -633,7 +634,7 @@ fn mempool_during_reorg() -> anyhow::Result<()> {
             let mempool = emitter
                 .mempool()?
                 .into_iter()
-                .map(|(tx, _)| tx.txid())
+                .map(|(tx, _)| tx.compute_txid())
                 .collect::<BTreeSet<_>>();
             let exp_mempool = tx_introductions
                 .iter()
@@ -648,7 +649,7 @@ fn mempool_during_reorg() -> anyhow::Result<()> {
             let mempool = emitter
                 .mempool()?
                 .into_iter()
-                .map(|(tx, _)| tx.txid())
+                .map(|(tx, _)| tx.compute_txid())
                 .collect::<BTreeSet<_>>();
             let exp_mempool = tx_introductions
                 .iter()

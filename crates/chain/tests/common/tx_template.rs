@@ -3,7 +3,7 @@
 use rand::distributions::{Alphanumeric, DistString};
 use std::collections::HashMap;
 
-use bdk_chain::{tx_graph::TxGraph, Anchor, SpkTxOutIndex};
+use bdk_chain::{spk_txout::SpkTxOutIndex, tx_graph::TxGraph, Anchor};
 use bitcoin::{
     locktime::absolute::LockTime, secp256k1::Secp256k1, transaction, Amount, OutPoint, ScriptBuf,
     Sequence, Transaction, TxIn, TxOut, Txid, Witness,
@@ -119,21 +119,19 @@ pub fn init_graph<'a, A: Anchor + Clone + 'a>(
                     },
                     Some(index) => TxOut {
                         value: Amount::from_sat(output.value),
-                        script_pubkey: spk_index.spk_at_index(index).unwrap().to_owned(),
+                        script_pubkey: spk_index.spk_at_index(index).unwrap(),
                     },
                 })
                 .collect(),
         };
 
-        tx_ids.insert(tx_tmp.tx_name, tx.txid());
+        tx_ids.insert(tx_tmp.tx_name, tx.compute_txid());
         spk_index.scan(&tx);
         let _ = graph.insert_tx(tx.clone());
         for anchor in tx_tmp.anchors.iter() {
-            let _ = graph.insert_anchor(tx.txid(), anchor.clone());
+            let _ = graph.insert_anchor(tx.compute_txid(), anchor.clone());
         }
-        if let Some(seen_at) = tx_tmp.last_seen {
-            let _ = graph.insert_seen_at(tx.txid(), seen_at);
-        }
+        let _ = graph.insert_seen_at(tx.compute_txid(), tx_tmp.last_seen.unwrap_or(0));
     }
     (graph, spk_index, tx_ids)
 }

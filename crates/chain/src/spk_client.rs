@@ -1,18 +1,11 @@
 //! Helper types for spk-based blockchain clients.
 
 use crate::{
-    collections::{BTreeMap, HashMap},
-    local_chain::CheckPoint,
-    ConfirmationTimeHeightAnchor, TxGraph,
+    collections::BTreeMap, local_chain::CheckPoint, ConfirmationBlockTime, Indexed, TxGraph,
 };
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use bitcoin::{OutPoint, Script, ScriptBuf, Transaction, Txid};
-use core::{fmt::Debug, marker::PhantomData, ops::RangeBounds};
-
-/// A cache of [`Arc`]-wrapped full transactions, identified by their [`Txid`]s.
-///
-/// This is used by the chain-source to avoid re-fetching full transactions.
-pub type TxCache = HashMap<Txid, Arc<Transaction>>;
+use alloc::boxed::Box;
+use bitcoin::{OutPoint, Script, ScriptBuf, Txid};
+use core::marker::PhantomData;
 
 /// Data required to perform a spk-based blockchain client sync.
 ///
@@ -24,8 +17,6 @@ pub struct SyncRequest {
     ///
     /// [`LocalChain::tip`]: crate::local_chain::LocalChain::tip
     pub chain_tip: CheckPoint,
-    /// Cache of full transactions, so the chain-source can avoid re-fetching.
-    pub tx_cache: TxCache,
     /// Transactions that spend from or to these indexed script pubkeys.
     pub spks: Box<dyn ExactSizeIterator<Item = ScriptBuf> + Send>,
     /// Transactions with these txids.
@@ -39,34 +30,10 @@ impl SyncRequest {
     pub fn from_chain_tip(cp: CheckPoint) -> Self {
         Self {
             chain_tip: cp,
-            tx_cache: TxCache::new(),
             spks: Box::new(core::iter::empty()),
             txids: Box::new(core::iter::empty()),
             outpoints: Box::new(core::iter::empty()),
         }
-    }
-
-    /// Add to the [`TxCache`] held by the request.
-    ///
-    /// This consumes the [`SyncRequest`] and returns the updated one.
-    #[must_use]
-    pub fn cache_txs<T>(mut self, full_txs: impl IntoIterator<Item = (Txid, T)>) -> Self
-    where
-        T: Into<Arc<Transaction>>,
-    {
-        self.tx_cache = full_txs
-            .into_iter()
-            .map(|(txid, tx)| (txid, tx.into()))
-            .collect();
-        self
-    }
-
-    /// Add all transactions from [`TxGraph`] into the [`TxCache`].
-    ///
-    /// This consumes the [`SyncRequest`] and returns the updated one.
-    #[must_use]
-    pub fn cache_graph_txs<A>(self, graph: &TxGraph<A>) -> Self {
-        self.cache_txs(graph.full_txs().map(|tx_node| (tx_node.txid, tx_node.tx)))
     }
 
     /// Set the [`Script`]s that will be synced against.
@@ -190,16 +157,17 @@ impl SyncRequest {
     /// This consumes the [`SyncRequest`] and returns the updated one.
     #[cfg(feature = "miniscript")]
     #[must_use]
-    pub fn populate_with_revealed_spks<K: Clone + Ord + Debug + Send + Sync>(
+    pub fn populate_with_revealed_spks<K: Clone + Ord + core::fmt::Debug + Send + Sync>(
         self,
-        index: &crate::keychain::KeychainTxOutIndex<K>,
-        spk_range: impl RangeBounds<K>,
+        index: &crate::indexer::keychain_txout::KeychainTxOutIndex<K>,
+        spk_range: impl core::ops::RangeBounds<K>,
     ) -> Self {
         use alloc::borrow::ToOwned;
+        use alloc::vec::Vec;
         self.chain_spks(
             index
                 .revealed_spks(spk_range)
-                .map(|(_, _, spk)| spk.to_owned())
+                .map(|(_, spk)| spk.to_owned())
                 .collect::<Vec<_>>(),
         )
     }
@@ -208,7 +176,7 @@ impl SyncRequest {
 /// Data returned from a spk-based blockchain client sync.
 ///
 /// See also [`SyncRequest`].
-pub struct SyncResult<A = ConfirmationTimeHeightAnchor> {
+pub struct SyncResult<A = ConfirmationBlockTime> {
     /// The update to apply to the receiving [`TxGraph`].
     pub graph_update: TxGraph<A>,
     /// The update to apply to the receiving [`LocalChain`](crate::local_chain::LocalChain).
@@ -227,10 +195,8 @@ pub struct FullScanRequest<K> {
     ///
     /// [`LocalChain::tip`]: crate::local_chain::LocalChain::tip
     pub chain_tip: CheckPoint,
-    /// Cache of full transactions, so the chain-source can avoid re-fetching.
-    pub tx_cache: TxCache,
     /// Iterators of script pubkeys indexed by the keychain index.
-    pub spks_by_keychain: BTreeMap<K, Box<dyn Iterator<Item = (u32, ScriptBuf)> + Send>>,
+    pub spks_by_keychain: BTreeMap<K, Box<dyn Iterator<Item = Indexed<ScriptBuf>> + Send>>,
 }
 
 impl<K: Ord + Clone> FullScanRequest<K> {
@@ -239,32 +205,8 @@ impl<K: Ord + Clone> FullScanRequest<K> {
     pub fn from_chain_tip(chain_tip: CheckPoint) -> Self {
         Self {
             chain_tip,
-            tx_cache: TxCache::new(),
             spks_by_keychain: BTreeMap::new(),
         }
-    }
-
-    /// Add to the [`TxCache`] held by the request.
-    ///
-    /// This consumes the [`SyncRequest`] and returns the updated one.
-    #[must_use]
-    pub fn cache_txs<T>(mut self, full_txs: impl IntoIterator<Item = (Txid, T)>) -> Self
-    where
-        T: Into<Arc<Transaction>>,
-    {
-        self.tx_cache = full_txs
-            .into_iter()
-            .map(|(txid, tx)| (txid, tx.into()))
-            .collect();
-        self
-    }
-
-    /// Add all transactions from [`TxGraph`] into the [`TxCache`].
-    ///
-    /// This consumes the [`SyncRequest`] and returns the updated one.
-    #[must_use]
-    pub fn cache_graph_txs<A>(self, graph: &TxGraph<A>) -> Self {
-        self.cache_txs(graph.full_txs().map(|tx_node| (tx_node.txid, tx_node.tx)))
     }
 
     /// Construct a new [`FullScanRequest`] from a given `chain_tip` and `index`.
@@ -273,15 +215,15 @@ impl<K: Ord + Clone> FullScanRequest<K> {
     /// [`KeychainTxOutIndex::all_unbounded_spk_iters`] and is used to populate the
     /// [`FullScanRequest`].
     ///
-    /// [`KeychainTxOutIndex::all_unbounded_spk_iters`]: crate::keychain::KeychainTxOutIndex::all_unbounded_spk_iters
+    /// [`KeychainTxOutIndex::all_unbounded_spk_iters`]: crate::indexer::keychain_txout::KeychainTxOutIndex::all_unbounded_spk_iters
     #[cfg(feature = "miniscript")]
     #[must_use]
     pub fn from_keychain_txout_index(
         chain_tip: CheckPoint,
-        index: &crate::keychain::KeychainTxOutIndex<K>,
+        index: &crate::indexer::keychain_txout::KeychainTxOutIndex<K>,
     ) -> Self
     where
-        K: Debug,
+        K: core::fmt::Debug,
     {
         let mut req = Self::from_chain_tip(chain_tip);
         for (keychain, spks) in index.all_unbounded_spk_iters() {
@@ -297,7 +239,7 @@ impl<K: Ord + Clone> FullScanRequest<K> {
     pub fn set_spks_for_keychain(
         mut self,
         keychain: K,
-        spks: impl IntoIterator<IntoIter = impl Iterator<Item = (u32, ScriptBuf)> + Send + 'static>,
+        spks: impl IntoIterator<IntoIter = impl Iterator<Item = Indexed<ScriptBuf>> + Send + 'static>,
     ) -> Self {
         self.spks_by_keychain
             .insert(keychain, Box::new(spks.into_iter()));
@@ -311,7 +253,7 @@ impl<K: Ord + Clone> FullScanRequest<K> {
     pub fn chain_spks_for_keychain(
         mut self,
         keychain: K,
-        spks: impl IntoIterator<IntoIter = impl Iterator<Item = (u32, ScriptBuf)> + Send + 'static>,
+        spks: impl IntoIterator<IntoIter = impl Iterator<Item = Indexed<ScriptBuf>> + Send + 'static>,
     ) -> Self {
         match self.spks_by_keychain.remove(&keychain) {
             // clippy here suggests to remove `into_iter` from `spks.into_iter()`, but doing so
@@ -375,7 +317,7 @@ impl<K: Ord + Clone> FullScanRequest<K> {
 /// Data returned from a spk-based blockchain client full scan.
 ///
 /// See also [`FullScanRequest`].
-pub struct FullScanResult<K, A = ConfirmationTimeHeightAnchor> {
+pub struct FullScanResult<K, A = ConfirmationBlockTime> {
     /// The update to apply to the receiving [`LocalChain`](crate::local_chain::LocalChain).
     pub graph_update: TxGraph<A>,
     /// The update to apply to the receiving [`TxGraph`].

@@ -20,8 +20,7 @@ use alloc::vec::Vec;
 /// # use bdk_chain::local_chain::LocalChain;
 /// # use bdk_chain::tx_graph::TxGraph;
 /// # use bdk_chain::BlockId;
-/// # use bdk_chain::ConfirmationHeightAnchor;
-/// # use bdk_chain::ConfirmationTimeHeightAnchor;
+/// # use bdk_chain::ConfirmationBlockTime;
 /// # use bdk_chain::example_utils::*;
 /// # use bitcoin::hashes::Hash;
 /// // Initialize the local chain with two blocks.
@@ -43,46 +42,26 @@ use alloc::vec::Vec;
 /// let mut graph_a = TxGraph::<BlockId>::default();
 /// let _ = graph_a.insert_tx(tx.clone());
 /// graph_a.insert_anchor(
-///     tx.txid(),
+///     tx.compute_txid(),
 ///     BlockId {
 ///         height: 1,
 ///         hash: Hash::hash("first".as_bytes()),
 ///     },
 /// );
 ///
-/// // Insert `tx` into a `TxGraph` that uses `ConfirmationHeightAnchor` as the anchor type.
-/// // This anchor records the anchor block and the confirmation height of the transaction.
-/// // When a transaction is anchored with `ConfirmationHeightAnchor`, the anchor block and
-/// // confirmation block can be different. However, the confirmation block cannot be higher than
-/// // the anchor block and both blocks must be in the same chain for the anchor to be valid.
-/// let mut graph_b = TxGraph::<ConfirmationHeightAnchor>::default();
-/// let _ = graph_b.insert_tx(tx.clone());
-/// graph_b.insert_anchor(
-///     tx.txid(),
-///     ConfirmationHeightAnchor {
-///         anchor_block: BlockId {
-///             height: 2,
-///             hash: Hash::hash("second".as_bytes()),
-///         },
-///         confirmation_height: 1,
-///     },
-/// );
-///
-/// // Insert `tx` into a `TxGraph` that uses `ConfirmationTimeHeightAnchor` as the anchor type.
-/// // This anchor records the anchor block, the confirmation height and time of the transaction.
-/// // When a transaction is anchored with `ConfirmationTimeHeightAnchor`, the anchor block and
-/// // confirmation block can be different. However, the confirmation block cannot be higher than
-/// // the anchor block and both blocks must be in the same chain for the anchor to be valid.
-/// let mut graph_c = TxGraph::<ConfirmationTimeHeightAnchor>::default();
+/// // Insert `tx` into a `TxGraph` that uses `ConfirmationBlockTime` as the anchor type.
+/// // This anchor records the anchor block and the confirmation time of the transaction. When a
+/// // transaction is anchored with `ConfirmationBlockTime`, the anchor block and confirmation block
+/// // of the transaction is the same block.
+/// let mut graph_c = TxGraph::<ConfirmationBlockTime>::default();
 /// let _ = graph_c.insert_tx(tx.clone());
 /// graph_c.insert_anchor(
-///     tx.txid(),
-///     ConfirmationTimeHeightAnchor {
-///         anchor_block: BlockId {
+///     tx.compute_txid(),
+///     ConfirmationBlockTime {
+///         block_id: BlockId {
 ///             height: 2,
 ///             hash: Hash::hash("third".as_bytes()),
 ///         },
-///         confirmation_height: 1,
 ///         confirmation_time: 123,
 ///     },
 /// );
@@ -113,17 +92,26 @@ pub trait AnchorFromBlockPosition: Anchor {
     fn from_block_position(block: &bitcoin::Block, block_id: BlockId, tx_pos: usize) -> Self;
 }
 
-/// Trait that makes an object appendable.
-pub trait Append {
-    /// Append another object of the same type onto `self`.
-    fn append(&mut self, other: Self);
+/// Trait that makes an object mergeable.
+pub trait Merge: Default {
+    /// Merge another object of the same type onto `self`.
+    fn merge(&mut self, other: Self);
 
     /// Returns whether the structure is considered empty.
     fn is_empty(&self) -> bool;
+
+    /// Take the value, replacing it with the default value.
+    fn take(&mut self) -> Option<Self> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(core::mem::take(self))
+        }
+    }
 }
 
-impl<K: Ord, V> Append for BTreeMap<K, V> {
-    fn append(&mut self, other: Self) {
+impl<K: Ord, V> Merge for BTreeMap<K, V> {
+    fn merge(&mut self, other: Self) {
         // We use `extend` instead of `BTreeMap::append` due to performance issues with `append`.
         // Refer to https://github.com/rust-lang/rust/issues/34666#issuecomment-675658420
         BTreeMap::extend(self, other)
@@ -134,8 +122,8 @@ impl<K: Ord, V> Append for BTreeMap<K, V> {
     }
 }
 
-impl<T: Ord> Append for BTreeSet<T> {
-    fn append(&mut self, other: Self) {
+impl<T: Ord> Merge for BTreeSet<T> {
+    fn merge(&mut self, other: Self) {
         // We use `extend` instead of `BTreeMap::append` due to performance issues with `append`.
         // Refer to https://github.com/rust-lang/rust/issues/34666#issuecomment-675658420
         BTreeSet::extend(self, other)
@@ -146,8 +134,8 @@ impl<T: Ord> Append for BTreeSet<T> {
     }
 }
 
-impl<T> Append for Vec<T> {
-    fn append(&mut self, mut other: Self) {
+impl<T> Merge for Vec<T> {
+    fn merge(&mut self, mut other: Self) {
         Vec::append(self, &mut other)
     }
 
@@ -156,30 +144,30 @@ impl<T> Append for Vec<T> {
     }
 }
 
-macro_rules! impl_append_for_tuple {
+macro_rules! impl_merge_for_tuple {
     ($($a:ident $b:tt)*) => {
-        impl<$($a),*> Append for ($($a,)*) where $($a: Append),* {
+        impl<$($a),*> Merge for ($($a,)*) where $($a: Merge),* {
 
-            fn append(&mut self, _other: Self) {
-                $(Append::append(&mut self.$b, _other.$b) );*
+            fn merge(&mut self, _other: Self) {
+                $(Merge::merge(&mut self.$b, _other.$b) );*
             }
 
             fn is_empty(&self) -> bool {
-                $(Append::is_empty(&self.$b) && )* true
+                $(Merge::is_empty(&self.$b) && )* true
             }
         }
     }
 }
 
-impl_append_for_tuple!();
-impl_append_for_tuple!(T0 0);
-impl_append_for_tuple!(T0 0 T1 1);
-impl_append_for_tuple!(T0 0 T1 1 T2 2);
-impl_append_for_tuple!(T0 0 T1 1 T2 2 T3 3);
-impl_append_for_tuple!(T0 0 T1 1 T2 2 T3 3 T4 4);
-impl_append_for_tuple!(T0 0 T1 1 T2 2 T3 3 T4 4 T5 5);
-impl_append_for_tuple!(T0 0 T1 1 T2 2 T3 3 T4 4 T5 5 T6 6);
-impl_append_for_tuple!(T0 0 T1 1 T2 2 T3 3 T4 4 T5 5 T6 6 T7 7);
-impl_append_for_tuple!(T0 0 T1 1 T2 2 T3 3 T4 4 T5 5 T6 6 T7 7 T8 8);
-impl_append_for_tuple!(T0 0 T1 1 T2 2 T3 3 T4 4 T5 5 T6 6 T7 7 T8 8 T9 9);
-impl_append_for_tuple!(T0 0 T1 1 T2 2 T3 3 T4 4 T5 5 T6 6 T7 7 T8 8 T9 9 T10 10);
+impl_merge_for_tuple!();
+impl_merge_for_tuple!(T0 0);
+impl_merge_for_tuple!(T0 0 T1 1);
+impl_merge_for_tuple!(T0 0 T1 1 T2 2);
+impl_merge_for_tuple!(T0 0 T1 1 T2 2 T3 3);
+impl_merge_for_tuple!(T0 0 T1 1 T2 2 T3 3 T4 4);
+impl_merge_for_tuple!(T0 0 T1 1 T2 2 T3 3 T4 4 T5 5);
+impl_merge_for_tuple!(T0 0 T1 1 T2 2 T3 3 T4 4 T5 5 T6 6);
+impl_merge_for_tuple!(T0 0 T1 1 T2 2 T3 3 T4 4 T5 5 T6 6 T7 7);
+impl_merge_for_tuple!(T0 0 T1 1 T2 2 T3 3 T4 4 T5 5 T6 6 T7 7 T8 8);
+impl_merge_for_tuple!(T0 0 T1 1 T2 2 T3 3 T4 4 T5 5 T6 6 T7 7 T8 8 T9 9);
+impl_merge_for_tuple!(T0 0 T1 1 T2 2 T3 3 T4 4 T5 5 T6 6 T7 7 T8 8 T9 9 T10 10);

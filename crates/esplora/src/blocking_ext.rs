@@ -1,15 +1,14 @@
 use std::collections::BTreeSet;
 use std::thread::JoinHandle;
-use std::usize;
 
 use bdk_chain::collections::BTreeMap;
 use bdk_chain::spk_client::{FullScanRequest, FullScanResult, SyncRequest, SyncResult};
-use bdk_chain::Anchor;
 use bdk_chain::{
     bitcoin::{Amount, BlockHash, OutPoint, ScriptBuf, TxOut, Txid},
     local_chain::CheckPoint,
-    BlockId, ConfirmationTimeHeightAnchor, TxGraph,
+    BlockId, ConfirmationBlockTime, TxGraph,
 };
+use bdk_chain::{Anchor, Indexed};
 use esplora_client::TxStatus;
 
 use crate::anchor_from_status;
@@ -214,16 +213,16 @@ fn chain_update<A: Anchor>(
 }
 
 /// This performs a full scan to get an update for the [`TxGraph`] and
-/// [`KeychainTxOutIndex`](bdk_chain::keychain::KeychainTxOutIndex).
+/// [`KeychainTxOutIndex`](bdk_chain::indexer::keychain_txout::KeychainTxOutIndex).
 fn full_scan_for_index_and_graph_blocking<K: Ord + Clone>(
     client: &esplora_client::BlockingClient,
-    keychain_spks: BTreeMap<K, impl IntoIterator<Item = (u32, ScriptBuf)>>,
+    keychain_spks: BTreeMap<K, impl IntoIterator<Item = Indexed<ScriptBuf>>>,
     stop_gap: usize,
     parallel_requests: usize,
-) -> Result<(TxGraph<ConfirmationTimeHeightAnchor>, BTreeMap<K, u32>), Error> {
+) -> Result<(TxGraph<ConfirmationBlockTime>, BTreeMap<K, u32>), Error> {
     type TxsOfSpkIndex = (u32, Vec<esplora_client::Tx>);
     let parallel_requests = Ord::max(parallel_requests, 1);
-    let mut tx_graph = TxGraph::<ConfirmationTimeHeightAnchor>::default();
+    let mut tx_graph = TxGraph::<ConfirmationBlockTime>::default();
     let mut last_active_indices = BTreeMap::<K, u32>::new();
 
     for (keychain, spks) in keychain_spks {
@@ -316,7 +315,7 @@ fn sync_for_index_and_graph_blocking(
     txids: impl IntoIterator<Item = Txid>,
     outpoints: impl IntoIterator<Item = OutPoint>,
     parallel_requests: usize,
-) -> Result<TxGraph<ConfirmationTimeHeightAnchor>, Error> {
+) -> Result<TxGraph<ConfirmationBlockTime>, Error> {
     let (mut tx_graph, _) = full_scan_for_index_and_graph_blocking(
         client,
         {

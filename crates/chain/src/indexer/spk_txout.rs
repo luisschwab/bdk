@@ -1,10 +1,12 @@
+//! [`SpkTxOutIndex`] is an index storing [`TxOut`]s that have a script pubkey that matches those in a list.
+
 use core::ops::RangeBounds;
 
 use crate::{
     collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap},
-    indexed_tx_graph::Indexer,
+    Indexer,
 };
-use bitcoin::{Amount, OutPoint, Script, ScriptBuf, SignedAmount, Transaction, TxOut, Txid};
+use bitcoin::{Amount, OutPoint, ScriptBuf, SignedAmount, Transaction, TxOut, Txid};
 
 /// An index storing [`TxOut`]s that have a script pubkey that matches those in a list.
 ///
@@ -52,7 +54,7 @@ impl<I> Default for SpkTxOutIndex<I> {
     }
 }
 
-impl<I: Clone + Ord> Indexer for SpkTxOutIndex<I> {
+impl<I: Clone + Ord + core::fmt::Debug> Indexer for SpkTxOutIndex<I> {
     type ChangeSet = ();
 
     fn index_txout(&mut self, outpoint: OutPoint, txout: &TxOut) -> Self::ChangeSet {
@@ -76,7 +78,7 @@ impl<I: Clone + Ord> Indexer for SpkTxOutIndex<I> {
     }
 }
 
-impl<I: Clone + Ord> SpkTxOutIndex<I> {
+impl<I: Clone + Ord + core::fmt::Debug> SpkTxOutIndex<I> {
     /// Scans a transaction's outputs for matching script pubkeys.
     ///
     /// Typically, this is used in two situations:
@@ -86,7 +88,7 @@ impl<I: Clone + Ord> SpkTxOutIndex<I> {
     /// 2. When getting new data from the chain, you usually scan it before incorporating it into your chain state.
     pub fn scan(&mut self, tx: &Transaction) -> BTreeSet<I> {
         let mut scanned_indices = BTreeSet::new();
-        let txid = tx.txid();
+        let txid = tx.compute_txid();
         for (i, txout) in tx.output.iter().enumerate() {
             let op = OutPoint::new(txid, i as u32);
             if let Some(spk_i) = self.scan_txout(op, txout) {
@@ -174,8 +176,8 @@ impl<I: Clone + Ord> SpkTxOutIndex<I> {
     /// Returns the script that has been inserted at the `index`.
     ///
     /// If that index hasn't been inserted yet, it will return `None`.
-    pub fn spk_at_index(&self, index: &I) -> Option<&Script> {
-        self.spks.get(index).map(|s| s.as_script())
+    pub fn spk_at_index(&self, index: &I) -> Option<ScriptBuf> {
+        self.spks.get(index).cloned()
     }
 
     /// The script pubkeys that are being tracked by the index.
@@ -206,7 +208,7 @@ impl<I: Clone + Ord> SpkTxOutIndex<I> {
     /// # Example
     ///
     /// ```rust
-    /// # use bdk_chain::SpkTxOutIndex;
+    /// # use bdk_chain::spk_txout::SpkTxOutIndex;
     ///
     /// // imagine our spks are indexed like (keychain, derivation_index).
     /// let txout_index = SpkTxOutIndex::<(u32, u32)>::default();
@@ -215,7 +217,10 @@ impl<I: Clone + Ord> SpkTxOutIndex<I> {
     /// let unused_change_spks =
     ///     txout_index.unused_spks((change_index, u32::MIN)..(change_index, u32::MAX));
     /// ```
-    pub fn unused_spks<R>(&self, range: R) -> impl DoubleEndedIterator<Item = (&I, &Script)> + Clone
+    pub fn unused_spks<R>(
+        &self,
+        range: R,
+    ) -> impl DoubleEndedIterator<Item = (&I, ScriptBuf)> + Clone + '_
     where
         R: RangeBounds<I>,
     {
@@ -266,8 +271,8 @@ impl<I: Clone + Ord> SpkTxOutIndex<I> {
     }
 
     /// Returns the index associated with the script pubkey.
-    pub fn index_of_spk(&self, script: &Script) -> Option<&I> {
-        self.spk_indices.get(script)
+    pub fn index_of_spk(&self, script: ScriptBuf) -> Option<&I> {
+        self.spk_indices.get(script.as_script())
     }
 
     /// Computes the total value transfer effect `tx` has on the script pubkeys in `range`. Value is
@@ -291,7 +296,7 @@ impl<I: Clone + Ord> SpkTxOutIndex<I> {
             }
         }
         for txout in &tx.output {
-            if let Some(index) = self.index_of_spk(&txout.script_pubkey) {
+            if let Some(index) = self.index_of_spk(txout.script_pubkey.clone()) {
                 if range.contains(index) {
                     received += txout.value;
                 }

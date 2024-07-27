@@ -1,11 +1,13 @@
 //! Contains the [`IndexedTxGraph`] and associated types. Refer to the
 //! [`IndexedTxGraph`] documentation for more.
+use core::fmt::Debug;
+
 use alloc::vec::Vec;
 use bitcoin::{Block, OutPoint, Transaction, TxOut, Txid};
 
 use crate::{
     tx_graph::{self, TxGraph},
-    Anchor, AnchorFromBlockPosition, Append, BlockId,
+    Anchor, AnchorFromBlockPosition, BlockId, Indexer, Merge,
 };
 
 /// The [`IndexedTxGraph`] combines a [`TxGraph`] and an [`Indexer`] implementation.
@@ -47,27 +49,30 @@ impl<A: Anchor, I: Indexer> IndexedTxGraph<A, I> {
     pub fn apply_changeset(&mut self, changeset: ChangeSet<A, I::ChangeSet>) {
         self.index.apply_changeset(changeset.indexer);
 
-        for tx in &changeset.graph.txs {
+        for tx in &changeset.tx_graph.txs {
             self.index.index_tx(tx);
         }
-        for (&outpoint, txout) in &changeset.graph.txouts {
+        for (&outpoint, txout) in &changeset.tx_graph.txouts {
             self.index.index_txout(outpoint, txout);
         }
 
-        self.graph.apply_changeset(changeset.graph);
+        self.graph.apply_changeset(changeset.tx_graph);
     }
 
     /// Determines the [`ChangeSet`] between `self` and an empty [`IndexedTxGraph`].
     pub fn initial_changeset(&self) -> ChangeSet<A, I::ChangeSet> {
         let graph = self.graph.initial_changeset();
         let indexer = self.index.initial_changeset();
-        ChangeSet { graph, indexer }
+        ChangeSet {
+            tx_graph: graph,
+            indexer,
+        }
     }
 }
 
 impl<A: Anchor, I: Indexer> IndexedTxGraph<A, I>
 where
-    I::ChangeSet: Default + Append,
+    I::ChangeSet: Default + Merge,
 {
     fn index_tx_graph_changeset(
         &mut self,
@@ -75,10 +80,10 @@ where
     ) -> I::ChangeSet {
         let mut changeset = I::ChangeSet::default();
         for added_tx in &tx_graph_changeset.txs {
-            changeset.append(self.index.index_tx(added_tx));
+            changeset.merge(self.index.index_tx(added_tx));
         }
         for (&added_outpoint, added_txout) in &tx_graph_changeset.txouts {
-            changeset.append(self.index.index_txout(added_outpoint, added_txout));
+            changeset.merge(self.index.index_txout(added_outpoint, added_txout));
         }
         changeset
     }
@@ -89,21 +94,30 @@ where
     pub fn apply_update(&mut self, update: TxGraph<A>) -> ChangeSet<A, I::ChangeSet> {
         let graph = self.graph.apply_update(update);
         let indexer = self.index_tx_graph_changeset(&graph);
-        ChangeSet { graph, indexer }
+        ChangeSet {
+            tx_graph: graph,
+            indexer,
+        }
     }
 
     /// Insert a floating `txout` of given `outpoint`.
     pub fn insert_txout(&mut self, outpoint: OutPoint, txout: TxOut) -> ChangeSet<A, I::ChangeSet> {
         let graph = self.graph.insert_txout(outpoint, txout);
         let indexer = self.index_tx_graph_changeset(&graph);
-        ChangeSet { graph, indexer }
+        ChangeSet {
+            tx_graph: graph,
+            indexer,
+        }
     }
 
     /// Insert and index a transaction into the graph.
     pub fn insert_tx(&mut self, tx: Transaction) -> ChangeSet<A, I::ChangeSet> {
         let graph = self.graph.insert_tx(tx);
         let indexer = self.index_tx_graph_changeset(&graph);
-        ChangeSet { graph, indexer }
+        ChangeSet {
+            tx_graph: graph,
+            indexer,
+        }
     }
 
     /// Insert an `anchor` for a given transaction.
@@ -137,21 +151,24 @@ where
 
         let mut indexer = I::ChangeSet::default();
         for (tx, _) in &txs {
-            indexer.append(self.index.index_tx(tx));
+            indexer.merge(self.index.index_tx(tx));
         }
 
         let mut graph = tx_graph::ChangeSet::default();
         for (tx, anchors) in txs {
             if self.index.is_tx_relevant(tx) {
-                let txid = tx.txid();
-                graph.append(self.graph.insert_tx(tx.clone()));
+                let txid = tx.compute_txid();
+                graph.merge(self.graph.insert_tx(tx.clone()));
                 for anchor in anchors {
-                    graph.append(self.graph.insert_anchor(txid, anchor));
+                    graph.merge(self.graph.insert_anchor(txid, anchor));
                 }
             }
         }
 
-        ChangeSet { graph, indexer }
+        ChangeSet {
+            tx_graph: graph,
+            indexer,
+        }
     }
 
     /// Batch insert unconfirmed transactions, filtering out those that are irrelevant.
@@ -176,7 +193,7 @@ where
 
         let mut indexer = I::ChangeSet::default();
         for (tx, _) in &txs {
-            indexer.append(self.index.index_tx(tx));
+            indexer.merge(self.index.index_tx(tx));
         }
 
         let graph = self.graph.batch_insert_unconfirmed(
@@ -185,7 +202,10 @@ where
                 .map(|(tx, seen_at)| (tx.clone(), seen_at)),
         );
 
-        ChangeSet { graph, indexer }
+        ChangeSet {
+            tx_graph: graph,
+            indexer,
+        }
     }
 
     /// Batch insert unconfirmed transactions.
@@ -203,14 +223,17 @@ where
     ) -> ChangeSet<A, I::ChangeSet> {
         let graph = self.graph.batch_insert_unconfirmed(txs);
         let indexer = self.index_tx_graph_changeset(&graph);
-        ChangeSet { graph, indexer }
+        ChangeSet {
+            tx_graph: graph,
+            indexer,
+        }
     }
 }
 
 /// Methods are available if the anchor (`A`) implements [`AnchorFromBlockPosition`].
 impl<A: Anchor, I: Indexer> IndexedTxGraph<A, I>
 where
-    I::ChangeSet: Default + Append,
+    I::ChangeSet: Default + Merge,
     A: AnchorFromBlockPosition,
 {
     /// Batch insert all transactions of the given `block` of `height`, filtering out those that are
@@ -232,14 +255,14 @@ where
         };
         let mut changeset = ChangeSet::<A, I::ChangeSet>::default();
         for (tx_pos, tx) in block.txdata.iter().enumerate() {
-            changeset.indexer.append(self.index.index_tx(tx));
+            changeset.indexer.merge(self.index.index_tx(tx));
             if self.index.is_tx_relevant(tx) {
-                let txid = tx.txid();
+                let txid = tx.compute_txid();
                 let anchor = A::from_block_position(block, block_id, tx_pos);
-                changeset.graph.append(self.graph.insert_tx(tx.clone()));
+                changeset.tx_graph.merge(self.graph.insert_tx(tx.clone()));
                 changeset
-                    .graph
-                    .append(self.graph.insert_anchor(txid, anchor));
+                    .tx_graph
+                    .merge(self.graph.insert_anchor(txid, anchor));
             }
         }
         changeset
@@ -261,11 +284,20 @@ where
         let mut graph = tx_graph::ChangeSet::default();
         for (tx_pos, tx) in block.txdata.iter().enumerate() {
             let anchor = A::from_block_position(&block, block_id, tx_pos);
-            graph.append(self.graph.insert_anchor(tx.txid(), anchor));
-            graph.append(self.graph.insert_tx(tx.clone()));
+            graph.merge(self.graph.insert_anchor(tx.compute_txid(), anchor));
+            graph.merge(self.graph.insert_tx(tx.clone()));
         }
         let indexer = self.index_tx_graph_changeset(&graph);
-        ChangeSet { graph, indexer }
+        ChangeSet {
+            tx_graph: graph,
+            indexer,
+        }
+    }
+}
+
+impl<A, I> AsRef<TxGraph<A>> for IndexedTxGraph<A, I> {
+    fn as_ref(&self) -> &TxGraph<A> {
+        &self.graph
     }
 }
 
@@ -285,7 +317,7 @@ where
 #[must_use]
 pub struct ChangeSet<A, IA> {
     /// [`TxGraph`] changeset.
-    pub graph: tx_graph::ChangeSet<A>,
+    pub tx_graph: tx_graph::ChangeSet<A>,
     /// [`Indexer`] changeset.
     pub indexer: IA,
 }
@@ -293,62 +325,38 @@ pub struct ChangeSet<A, IA> {
 impl<A, IA: Default> Default for ChangeSet<A, IA> {
     fn default() -> Self {
         Self {
-            graph: Default::default(),
+            tx_graph: Default::default(),
             indexer: Default::default(),
         }
     }
 }
 
-impl<A: Anchor, IA: Append> Append for ChangeSet<A, IA> {
-    fn append(&mut self, other: Self) {
-        self.graph.append(other.graph);
-        self.indexer.append(other.indexer);
+impl<A: Anchor, IA: Merge> Merge for ChangeSet<A, IA> {
+    fn merge(&mut self, other: Self) {
+        self.tx_graph.merge(other.tx_graph);
+        self.indexer.merge(other.indexer);
     }
 
     fn is_empty(&self) -> bool {
-        self.graph.is_empty() && self.indexer.is_empty()
+        self.tx_graph.is_empty() && self.indexer.is_empty()
     }
 }
 
 impl<A, IA: Default> From<tx_graph::ChangeSet<A>> for ChangeSet<A, IA> {
     fn from(graph: tx_graph::ChangeSet<A>) -> Self {
         Self {
-            graph,
+            tx_graph: graph,
             ..Default::default()
         }
     }
 }
 
 #[cfg(feature = "miniscript")]
-impl<A, K> From<crate::keychain::ChangeSet<K>> for ChangeSet<A, crate::keychain::ChangeSet<K>> {
-    fn from(indexer: crate::keychain::ChangeSet<K>) -> Self {
+impl<A> From<crate::keychain_txout::ChangeSet> for ChangeSet<A, crate::keychain_txout::ChangeSet> {
+    fn from(indexer: crate::keychain_txout::ChangeSet) -> Self {
         Self {
-            graph: Default::default(),
+            tx_graph: Default::default(),
             indexer,
         }
     }
-}
-
-/// Utilities for indexing transaction data.
-///
-/// Types which implement this trait can be used to construct an [`IndexedTxGraph`].
-/// This trait's methods should rarely be called directly.
-pub trait Indexer {
-    /// The resultant "changeset" when new transaction data is indexed.
-    type ChangeSet;
-
-    /// Scan and index the given `outpoint` and `txout`.
-    fn index_txout(&mut self, outpoint: OutPoint, txout: &TxOut) -> Self::ChangeSet;
-
-    /// Scans a transaction for relevant outpoints, which are stored and indexed internally.
-    fn index_tx(&mut self, tx: &Transaction) -> Self::ChangeSet;
-
-    /// Apply changeset to itself.
-    fn apply_changeset(&mut self, changeset: Self::ChangeSet);
-
-    /// Determines the [`ChangeSet`] between `self` and an empty [`Indexer`].
-    fn initial_changeset(&self) -> Self::ChangeSet;
-
-    /// Determines whether the transaction should be included in the index.
-    fn is_tx_relevant(&self, tx: &Transaction) -> bool;
 }

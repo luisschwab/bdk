@@ -57,29 +57,45 @@ that the `Wallet` can use to update its view of the chain.
 
 ## Persistence
 
-To persist the `Wallet` on disk, it must be constructed with a [`PersistBackend`] implementation.
+To persist `Wallet` state data use a data store crate that reads and writes [`ChangeSet`].
 
 **Implementations**
 
-* [`bdk_file_store`]: A simple flat-file implementation of [`PersistBackend`].
+* [`bdk_file_store`]: Stores wallet changes in a simple flat file.
 
 **Example**
 
 <!-- compile_fail because outpoint and txout are fake variables -->
-```rust,compile_fail
-use bdk_wallet::{bitcoin::Network, wallet::{ChangeSet, Wallet}};
+```rust,no_run
+use bdk_wallet::{bitcoin::Network, KeychainKind, ChangeSet, Wallet};
 
-fn main() {
-    // Create a new file `Store`.
-    let db = bdk_file_store::Store::<ChangeSet>::open_or_create_new(b"magic_bytes", "path/to/my_wallet.db").expect("create store");
+// Open or create a new file store for wallet data.
+let mut db =
+    bdk_file_store::Store::<ChangeSet>::open_or_create_new(b"magic_bytes", "/tmp/my_wallet.db")
+        .expect("create store");
 
-    let descriptor = "wpkh(tprv8ZgxMBicQKsPdcAqYBpzAFwU5yxBUo88ggoBqu1qPcHUfSbKK1sKMLmC7EAk438btHQrSdu3jGGQa6PA71nvH5nkDexhLteJqkM4dQmWF9g/84'/1'/0'/0/*)";
-    let mut wallet = Wallet::new_or_load(descriptor, None, db, Network::Testnet).expect("create or load wallet");
+// Create a wallet with initial wallet data read from the file store.
+let network = Network::Testnet;
+let descriptor = "wpkh(tprv8ZgxMBicQKsPdcAqYBpzAFwU5yxBUo88ggoBqu1qPcHUfSbKK1sKMLmC7EAk438btHQrSdu3jGGQa6PA71nvH5nkDexhLteJqkM4dQmWF9g/84'/1'/0'/0/*)";
+let change_descriptor = "wpkh(tprv8ZgxMBicQKsPdcAqYBpzAFwU5yxBUo88ggoBqu1qPcHUfSbKK1sKMLmC7EAk438btHQrSdu3jGGQa6PA71nvH5nkDexhLteJqkM4dQmWF9g/84'/1'/0'/1/*)";
+let wallet_opt = Wallet::load()
+    .descriptors(descriptor, change_descriptor)
+    .network(network)
+    .load_wallet(&mut db)
+    .expect("wallet");
+let mut wallet = match wallet_opt {
+    Some(wallet) => wallet,
+    None => Wallet::create(descriptor, change_descriptor)
+        .network(network)
+        .create_wallet(&mut db)
+        .expect("wallet"),
+};
 
-    // Insert a single `TxOut` at `OutPoint` into the wallet.
-    let _ = wallet.insert_txout(outpoint, txout);
-    wallet.commit().expect("must write to database");
-}
+// Get a new address to receive bitcoin.
+let receive_address = wallet.reveal_next_address(KeychainKind::External);
+// Persist staged wallet data changes to the file store.
+wallet.persist(&mut db).expect("persist");
+println!("Your new receive address is: {}", receive_address.address);
 ```
 
 <!-- ### Sync the balance of a descriptor -->
@@ -101,7 +117,7 @@ fn main() {
 
 <!--     wallet.sync(&blockchain, SyncOptions::default())?; -->
 
-<!--     println!("Descriptor balance: {} SAT", wallet.get_balance()?); -->
+<!--     println!("Descriptor balance: {} SAT", wallet.balance()?); -->
 
 <!--     Ok(()) -->
 <!-- } -->
@@ -110,11 +126,11 @@ fn main() {
 
 <!-- ```rust -->
 <!-- use bdk_wallet::Wallet; -->
-<!-- use bdk_wallet::wallet::AddressIndex::New; -->
+<!-- use bdk_wallet::AddressIndex::New; -->
 <!-- use bdk_wallet::bitcoin::Network; -->
 
 <!-- fn main() -> Result<(), bdk_wallet::Error> { -->
-<!--     let wallet = Wallet::new_no_persist( -->
+<!--     let wallet = Wallet::new( -->
 <!--         "wpkh([c258d2e4/84h/1h/0h]tpubDDYkZojQFQjht8Tm4jsS3iuEmKjTiEGjG6KnuFNKKJb5A6ZUCUZKdvLdSDWofKi4ToRCwb9poe1XdqfUnP4jaJjCB2Zwv11ZLgSbnZSNecE/0/*)", -->
 <!--         Some("wpkh([c258d2e4/84h/1h/0h]tpubDDYkZojQFQjht8Tm4jsS3iuEmKjTiEGjG6KnuFNKKJb5A6ZUCUZKdvLdSDWofKi4ToRCwb9poe1XdqfUnP4jaJjCB2Zwv11ZLgSbnZSNecE/1/*)"), -->
 <!--         Network::Testnet, -->
@@ -135,7 +151,7 @@ fn main() {
 <!-- use bdk_wallet::blockchain::ElectrumBlockchain; -->
 
 <!-- use bdk_wallet::electrum_client::Client; -->
-<!-- use bdk_wallet::wallet::AddressIndex::New; -->
+<!-- use bdk_wallet::AddressIndex::New; -->
 
 <!-- use bitcoin::base64; -->
 <!-- use bdk_wallet::bitcoin::consensus::serialize; -->
@@ -143,7 +159,7 @@ fn main() {
 
 <!-- fn main() -> Result<(), bdk_wallet::Error> { -->
 <!--     let blockchain = ElectrumBlockchain::from(Client::new("ssl://electrum.blockstream.info:60002")?); -->
-<!--     let wallet = Wallet::new_no_persist( -->
+<!--     let wallet = Wallet::new( -->
 <!--         "wpkh([c258d2e4/84h/1h/0h]tpubDDYkZojQFQjht8Tm4jsS3iuEmKjTiEGjG6KnuFNKKJb5A6ZUCUZKdvLdSDWofKi4ToRCwb9poe1XdqfUnP4jaJjCB2Zwv11ZLgSbnZSNecE/0/*)", -->
 <!--         Some("wpkh([c258d2e4/84h/1h/0h]tpubDDYkZojQFQjht8Tm4jsS3iuEmKjTiEGjG6KnuFNKKJb5A6ZUCUZKdvLdSDWofKi4ToRCwb9poe1XdqfUnP4jaJjCB2Zwv11ZLgSbnZSNecE/1/*)"), -->
 <!--         Network::Testnet, -->
@@ -179,7 +195,7 @@ fn main() {
 <!-- use bdk_wallet::bitcoin::Network; -->
 
 <!-- fn main() -> Result<(), bdk_wallet::Error> { -->
-<!--     let wallet = Wallet::new_no_persist( -->
+<!--     let wallet = Wallet::new( -->
 <!--         "wpkh([c258d2e4/84h/1h/0h]tprv8griRPhA7342zfRyB6CqeKF8CJDXYu5pgnj1cjL1u2ngKcJha5jjTRimG82ABzJQ4MQe71CV54xfn25BbhCNfEGGJZnxvCDQCd6JkbvxW6h/0/*)", -->
 <!--         Some("wpkh([c258d2e4/84h/1h/0h]tprv8griRPhA7342zfRyB6CqeKF8CJDXYu5pgnj1cjL1u2ngKcJha5jjTRimG82ABzJQ4MQe71CV54xfn25BbhCNfEGGJZnxvCDQCd6JkbvxW6h/1/*)"), -->
 <!--         Network::Testnet, -->
@@ -219,7 +235,6 @@ license, shall be dual licensed as above, without any additional terms or
 conditions.
 
 [`Wallet`]: https://docs.rs/bdk_wallet/latest/bdk_wallet/wallet/struct.Wallet.html
-[`PersistBackend`]: https://docs.rs/bdk_chain/latest/bdk_chain/trait.PersistBackend.html
 [`bdk_chain`]: https://docs.rs/bdk_chain/latest
 [`bdk_file_store`]: https://docs.rs/bdk_file_store/latest
 [`bdk_electrum`]: https://docs.rs/bdk_electrum/latest

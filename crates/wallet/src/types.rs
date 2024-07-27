@@ -13,8 +13,8 @@ use alloc::boxed::Box;
 use core::convert::AsRef;
 
 use bdk_chain::ConfirmationTime;
-use bitcoin::blockdata::transaction::{OutPoint, Sequence, TxOut};
-use bitcoin::psbt;
+use bitcoin::transaction::{OutPoint, Sequence, TxOut};
+use bitcoin::{psbt, Weight};
 
 use serde::{Deserialize, Serialize};
 
@@ -72,7 +72,7 @@ pub struct WeightedUtxo {
     /// properly maintain the feerate when adding this input to a transaction during coin selection.
     ///
     /// [weight units]: https://en.bitcoin.it/wiki/Weight_units
-    pub satisfaction_weight: usize,
+    pub satisfaction_weight: Weight,
     /// The UTXO
     pub utxo: Utxo,
 }
