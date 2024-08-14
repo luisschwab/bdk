@@ -62,7 +62,7 @@ struct RpcArgs {
     /// RPC auth password
     #[clap(env = "RPC_PASS", long)]
     rpc_password: Option<String>,
-    /// Starting block height to fallback to if no point of agreement if found
+    /// Starting block height to fallback to if no point of agreement is found
     #[clap(env = "FALLBACK_HEIGHT", long, default_value = "0")]
     fallback_height: u32,
 }
