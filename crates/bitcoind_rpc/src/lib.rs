@@ -141,6 +141,16 @@ impl<'c, C: bitcoincore_rpc::RpcApi> Emitter<'c, C> {
     }
 }
 
+/// An UTXO from a `scantxoutset` response that can be inserted into a TxGraph
+#[derive(Debug)]
+pub struct Coin {
+    /// txid and vout
+    pub outpoint: OutPoint,
+
+    /// value and spk
+    pub txout: TxOut,
+}
+
 /// A newly emitted block from [`Emitter`].
 #[derive(Debug)]
 pub struct BlockEvent<B> {
