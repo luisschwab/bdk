@@ -15,7 +15,15 @@ pub struct Balance {
 }
 
 impl Balance {
-    /// Get sum of trusted_pending and confirmed coins.
+    /// Get sum of confirmed, trusted_pending and untrusted_pending coins.
+    /// 
+    /// This is the balance you can spend right now that can 
+    /// possibly get cancelled by another party. Includes coinbase outputs.
+    pub fn spendable(&self) -> Amount {
+        self.confirmed + self.trusted_pending + self.untrusted_pending
+    }
+
+    /// Get sum of confirmed and trusted_pending coins.
     ///
     /// This is the balance you can spend right now that shouldn't get cancelled via another party
     /// double spending it.
